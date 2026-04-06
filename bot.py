@@ -507,7 +507,7 @@ def generate_coffee_card_image(
   <div class="bottombar">
     <div class="powered">
       <span class="powered-label">POWERED BY</span>
-      <span class="powered-name"><span class="t">Trading</span><span class="b">Brew</span></span>
+      <span class="powered-name">@<span class="t">Trading</span><span class="b">Brew</span></span>
     </div>
     <div class="called-by">
       <div class="called-by-label">CALLED BY</div>
@@ -675,7 +675,7 @@ HELP_TEXT = (
     "<code>/cafeboard</code> — Group leaderboard\n"
     "<code>/refresh</code> — Refresh leaderboard with live data\n"
     "<code>/help</code> — This message\n\n"
-    "Powered by TradingBrew ☕"
+    "Powered by @TradingBrew ☕"
 )
 
 
@@ -737,7 +737,7 @@ async def welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "Attached to this message is an example Coffee Card — "
         "this is what you'll get when you check your PnL ☕\n\n"
         "Type <code>/help</code> any time for full instructions.\n\n"
-        "<i>Powered by TradingBrew</i>"
+        "<i>Powered by @TradingBrew</i>"
     )
 
     if example_buf:
