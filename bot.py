@@ -647,12 +647,109 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "☕ Welcome to TheBrewBot!\n\n"
             "Add me to a group chat to start tracking crypto calls.\n"
             "Share a contract address with a thesis (20+ chars) and I'll brew it for you!\n\n"
-            "Commands:\n"
-            "/pnl <CA> — Check your gains with a Coffee Card\n"
-            "/cafeboard — View the group leaderboard\n"
-            "/refresh — Refresh the leaderboard\n\n"
-            "Brew your best alpha! ☕"
+            "Type /help for full instructions ☕"
         )
+
+
+HELP_TEXT = (
+    "☕ <b>BrewBot — How It Works</b> ☕\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "<b>1️⃣ Share a Call</b>\n"
+    "Drop a contract address in the group along with your thesis "
+    "(minimum 20 characters, at least 3 real words — no spam).\n\n"
+    "<b>2️⃣ Pick Your Brew</b>\n"
+    "BrewBot detects the CA, pulls live data from DexScreener, "
+    "and gives you two buttons:\n"
+    "  • <b>Alpha 🏆</b> — You're confident in this one\n"
+    "  • <b>Gamble 🎲</b> — It's a degen play\n\n"
+    "<b>3️⃣ Check Your PnL</b>\n"
+    "Run <code>/pnl &lt;contract_address&gt;</code> any time to see "
+    "your gains. BrewBot generates a Coffee Card showing your "
+    "multiplier, growth %, and call details.\n\n"
+    "<b>4️⃣ Compete on the Cafeboard</b>\n"
+    "Run <code>/cafeboard</code> to see who has the best calls "
+    "in the group. Top callers get 🔥\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "<b>Commands:</b>\n"
+    "<code>/pnl &lt;CA&gt;</code> — Coffee Card with your PnL\n"
+    "<code>/cafeboard</code> — Group leaderboard\n"
+    "<code>/refresh</code> — Refresh leaderboard with live data\n"
+    "<code>/help</code> — This message\n\n"
+    "Powered by TradingBrew ☕"
+)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /help — show usage instructions."""
+    if not update.message:
+        return
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
+
+
+async def welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send welcome message + example Coffee Card when bot is added to a group."""
+    if not update.message or not update.message.new_chat_members:
+        return
+
+    # Check if the bot itself is among the new members
+    bot_user = context.bot
+    bot_added = any(m.id == bot_user.id for m in update.message.new_chat_members)
+    if not bot_added:
+        return
+
+    chat = update.effective_chat
+    logger.info("Bot added to group: %s (%s)", chat.title if chat else "?", chat.id if chat else "?")
+
+    # Register chat for daily cafeboard
+    if chat:
+        upsert_active_chat(chat.id)
+
+    # Generate an example Coffee Card
+    try:
+        example_buf = generate_coffee_card_image(
+            ticker="BREW",
+            token_name="BrewCoin",
+            ca="B6e1sq9rTBmFCLP5mVPocdfn8cNjDJPE4mBBMhup4ump",
+            username="YourName",
+            thesis="Example call",
+            pct_gain=842.0,
+            x_mult=9.4,
+            call_type="alpha",
+            brewed_on="2026-01-15",
+            called_at_mcap="45.20K",
+            ath_mcap="425.88K",
+        )
+    except Exception as exc:
+        logger.error("Failed to generate welcome card: %s", exc)
+        example_buf = None
+
+    welcome_text = (
+        "☕ <b>BrewBot has entered the café!</b> ☕\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "I'm your crypto call tracker. Share a contract address "
+        "with your thesis and I'll lock in the market cap. "
+        "Come back later to check your PnL with a Coffee Card.\n\n"
+        "<b>How to use me:</b>\n\n"
+        "<b>1.</b> Paste a contract address + your thesis (min 20 chars, real words)\n"
+        "<b>2.</b> Tap <b>Alpha 🏆</b> or <b>Gamble 🎲</b> to lock in your call\n"
+        "<b>3.</b> Run <code>/pnl &lt;CA&gt;</code> to see your gains on a Coffee Card\n"
+        "<b>4.</b> Run <code>/cafeboard</code> to see who's the top caller\n\n"
+        "Attached to this message is an example Coffee Card — "
+        "this is what you'll get when you check your PnL ☕\n\n"
+        "Type <code>/help</code> any time for full instructions.\n\n"
+        "<i>Powered by TradingBrew</i>"
+    )
+
+    if example_buf:
+        await update.message.reply_photo(
+            photo=example_buf,
+            caption=welcome_text,
+            parse_mode="HTML",
+        )
+    else:
+        # Fallback: text-only if card generation fails
+        await update.message.reply_text(welcome_text, parse_mode="HTML")
+    logger.info("Welcome message sent to chat %s", chat.id if chat else "?")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -947,10 +1044,15 @@ def main() -> None:
 
     # Handlers
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("pnl", pnl_command))
     app.add_handler(CommandHandler("cafeboard", cafeboard_command))
     app.add_handler(CommandHandler("refresh", refresh_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    # Welcome handler — fires when new members (including the bot) join
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_handler)
+    )
     # Message handler — must be last to avoid swallowing commands
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, handle_message)
