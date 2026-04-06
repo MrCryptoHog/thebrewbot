@@ -228,7 +228,7 @@ def get_dexscreener_data(ca: str) -> Optional[dict]:
 # Formatting helpers
 # =========================================================================
 def fmt_usd(n: float) -> str:
-    """Pretty-print a USD value."""
+    """Pretty-print a USD value with $ sign."""
     if n >= 1_000_000_000:
         return f"${n / 1_000_000_000:.2f}B"
     if n >= 1_000_000:
@@ -236,6 +236,64 @@ def fmt_usd(n: float) -> str:
     if n >= 1_000:
         return f"${n / 1_000:.2f}K"
     return f"${n:,.2f}"
+
+
+def fmt_mcap(n: float) -> str:
+    """Pretty-print a market cap value without $ sign (for card display)."""
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.2f}K"
+    return f"{n:,.2f}"
+
+
+def is_valid_thesis(text: str) -> bool:
+    """
+    Check if a thesis is genuine and not spam/gibberish.
+    Rejects: repeated characters, single-char spam, keyboard mashing,
+    no real words, or insufficient word variety.
+    """
+    t = text.strip()
+    if len(t) < 20:
+        return False
+
+    # Reject if any single character makes up >60% of the text
+    from collections import Counter
+    counts = Counter(t.lower().replace(" ", ""))
+    total_chars = sum(counts.values())
+    if total_chars > 0:
+        most_common_char, most_common_count = counts.most_common(1)[0]
+        if most_common_count / total_chars > 0.60:
+            return False
+
+    # Reject if fewer than 3 unique characters (excluding spaces)
+    unique_chars = set(t.lower().replace(" ", ""))
+    if len(unique_chars) < 4:
+        return False
+
+    # Must have at least 3 words
+    words = t.split()
+    if len(words) < 3:
+        return False
+
+    # At least 3 unique words
+    unique_words = set(w.lower() for w in words)
+    if len(unique_words) < 3:
+        return False
+
+    # Reject if average word length is < 2 (single char spam with spaces)
+    avg_word_len = sum(len(w) for w in words) / len(words)
+    if avg_word_len < 2:
+        return False
+
+    # Reject if most words are just repeated single characters (e.g. "aaaa bbbb cccc")
+    spam_words = sum(1 for w in words if len(set(w.lower())) <= 1)
+    if spam_words / len(words) > 0.5:
+        return False
+
+    return True
 
 
 def pct_str(x: float) -> str:
@@ -612,11 +670,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Extract thesis (original text minus the CA)
     thesis = text.replace(ca, "").strip()
-    if len(thesis) < 20:
+    if len(thesis) < 20 or not is_valid_thesis(thesis):
         await update.message.reply_text(
-            "To submit a call as a gamble or alpha, you have to provide a "
-            "thesis/detail with the contract address you share, minimum 20 "
-            "characters (contract address excluded) ☕"
+            "☕ To submit a call, you need to provide a real thesis alongside "
+            "the contract address — minimum 20 characters, at least 3 real words. "
+            "No spam or gibberish! Give us your actual reasoning ☕"
         )
         return
 
@@ -778,18 +836,18 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     x_mult = current_mc / initial_mc
     pct_gain = (x_mult - 1) * 100
 
-    # Parse timestamp for "Brewed on"
+    # Parse timestamp for "Brewed on" — short YYYY-MM-DD format
     try:
         ts = datetime.fromisoformat(call["timestamp"])
-        brewed_on = ts.strftime("%b %d, %Y")
+        brewed_on = ts.strftime("%Y-%m-%d")
     except Exception:
         brewed_on = call["timestamp"]
 
     username = call["username"]
 
-    # Format mcap values for the card
-    called_at_mcap = fmt_usd(initial_mc)
-    ath_mcap = fmt_usd(current_mc) if x_mult >= 1 else fmt_usd(initial_mc)
+    # Format mcap values for the card (no $ sign)
+    called_at_mcap = fmt_mcap(initial_mc)
+    ath_mcap = fmt_mcap(current_mc) if x_mult >= 1 else fmt_mcap(initial_mc)
 
     # Generate Coffee Card
     card_buf = generate_coffee_card_image(
