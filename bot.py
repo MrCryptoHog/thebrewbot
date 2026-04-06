@@ -25,6 +25,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters,
 )
@@ -687,25 +688,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
 
-async def welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send welcome message + example Coffee Card when bot is added to a group."""
-    if not update.message or not update.message.new_chat_members:
-        return
-
-    # Check if the bot itself is among the new members
-    bot_user = context.bot
-    bot_added = any(m.id == bot_user.id for m in update.message.new_chat_members)
-    if not bot_added:
-        return
-
-    chat = update.effective_chat
-    logger.info("Bot added to group: %s (%s)", chat.title if chat else "?", chat.id if chat else "?")
+async def _send_welcome(chat_id: int, chat_title: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate example Coffee Card and send welcome message to a chat."""
+    logger.info("Sending welcome to: %s (%s)", chat_title, chat_id)
 
     # Register chat for daily cafeboard
-    if chat:
-        upsert_active_chat(chat.id)
+    upsert_active_chat(chat_id)
 
     # Generate an example Coffee Card
+    example_buf = None
     try:
         example_buf = generate_coffee_card_image(
             ticker="BREW",
@@ -721,8 +712,7 @@ async def welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ath_mcap="425.88K",
         )
     except Exception as exc:
-        logger.error("Failed to generate welcome card: %s", exc)
-        example_buf = None
+        logger.error("Failed to generate welcome card: %s", exc, exc_info=True)
 
     welcome_text = (
         "☕ <b>BrewBot has entered the café!</b> ☕\n"
@@ -735,22 +725,54 @@ async def welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "<b>2.</b> Tap <b>Alpha 🏆</b> or <b>Gamble 🎲</b> to lock in your call\n"
         "<b>3.</b> Run <code>/pnl &lt;CA&gt;</code> to see your gains on a Coffee Card\n"
         "<b>4.</b> Run <code>/cafeboard</code> to see who's the top caller\n\n"
-        "Attached to this message is an example Coffee Card — "
+        "Attached below is an example Coffee Card — "
         "this is what you'll get when you check your PnL ☕\n\n"
         "Type <code>/help</code> any time for full instructions.\n\n"
         "<i>Powered by @TradingBrew</i>"
     )
 
     if example_buf:
-        await update.message.reply_photo(
+        await context.bot.send_photo(
+            chat_id=chat_id,
             photo=example_buf,
             caption=welcome_text,
             parse_mode="HTML",
         )
     else:
-        # Fallback: text-only if card generation fails
-        await update.message.reply_text(welcome_text, parse_mode="HTML")
-    logger.info("Welcome message sent to chat %s", chat.id if chat else "?")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=welcome_text,
+            parse_mode="HTML",
+        )
+    logger.info("Welcome message sent to chat %s", chat_id)
+
+
+async def welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fallback: fires on new_chat_members status update (legacy path)."""
+    if not update.message or not update.message.new_chat_members:
+        return
+    bot_added = any(m.id == context.bot.id for m in update.message.new_chat_members)
+    if not bot_added:
+        return
+    chat = update.effective_chat
+    if chat:
+        await _send_welcome(chat.id, chat.title or "?", context)
+
+
+async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Primary: fires on my_chat_member update when bot is added/promoted in a group."""
+    if not update.my_chat_member:
+        return
+    old = update.my_chat_member.old_chat_member
+    new = update.my_chat_member.new_chat_member
+    # Detect transition from non-member/left/kicked → member/admin
+    was_member = old.status in ("member", "administrator", "creator")
+    is_member = new.status in ("member", "administrator", "creator")
+    if was_member or not is_member:
+        return  # not a "bot just joined" transition
+    chat = update.my_chat_member.chat
+    if chat:
+        await _send_welcome(chat.id, chat.title or "?", context)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1050,7 +1072,11 @@ def main() -> None:
     app.add_handler(CommandHandler("cafeboard", cafeboard_command))
     app.add_handler(CommandHandler("refresh", refresh_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    # Welcome handler — fires when new members (including the bot) join
+    # Welcome handler — primary: my_chat_member update (reliable)
+    app.add_handler(
+        ChatMemberHandler(chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
+    # Welcome handler — fallback: new_chat_members status update (legacy)
     app.add_handler(
         MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_handler)
     )
@@ -1073,7 +1099,10 @@ def main() -> None:
         logger.warning("JobQueue not available — daily auto-post disabled")
 
     logger.info("☕ TheBrewBot is starting up…")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,  # includes my_chat_member
+    )
 
 
 if __name__ == "__main__":
