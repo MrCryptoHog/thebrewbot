@@ -508,7 +508,7 @@ def generate_coffee_card_image(
   <div class="bottombar">
     <div class="powered">
       <span class="powered-label">POWERED BY</span>
-      <span class="powered-name">@<span class="t">Trading</span><span class="b">Brew</span></span>
+      <span class="powered-name"><span class="t">Trading</span><span class="b">Brew</span></span>
     </div>
     <div class="called-by">
       <div class="called-by-label">CALLED BY</div>
