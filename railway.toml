@@ -1,5 +1,6 @@
 [build]
 builder = "nixpacks"
+buildCommand = "pip install playwright && playwright install --with-deps chromium"
 
 [deploy]
 startCommand = "python bot.py"

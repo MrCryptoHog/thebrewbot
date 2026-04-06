@@ -2,23 +2,22 @@
 """
 ☕ TheBrewBot — The Coffee-Themed Crypto Call Tracker
 A cozy crypto-café Telegram bot that lets users "brew" calls and flex gains.
-Python 3.11+ | python-telegram-bot 20.x | SQLite | Pillow | DexScreener
+Python 3.11+ | python-telegram-bot 20.x | SQLite | Playwright | DexScreener
 """
 
 import os
 import re
 import io
+import html as _html
 import time
-import math
 import sqlite3
 import logging
-import textwrap
 from datetime import datetime, timezone
 from typing import Optional
 
 import requests
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
+from playwright.sync_api import sync_playwright
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -250,109 +249,72 @@ def x_str(x: float) -> str:
 
 
 # =========================================================================
-# Coffee Card Image Generation (Pillow)
+# Coffee Card Image Generation (Playwright) — v14 TradingBrew design
 # =========================================================================
+CARD_W, CARD_H = 1000, 600  # viewport; output is 2× (2000×1200)
 
-# Colour palette — warm coffee shop vibes
-BG_TOP = (42, 28, 20)        # deep espresso
-BG_BOT = (62, 42, 30)        # lighter roast
-ACCENT = (210, 160, 90)      # latte gold
-CREAM = (255, 248, 235)      # cream white
-GREEN = (80, 210, 120)       # profit green
-RED = (230, 80, 80)          # loss red
-MUTED = (180, 165, 148)      # muted text
-CARD_W, CARD_H = 800, 1000
+def _e(t):
+    """HTML-escape helper."""
+    return _html.escape(str(t))
 
-
-def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    """Try to load a nice system font; fall back to default."""
-    candidates = (
-        [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-        ]
-        if bold
-        else [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        ]
-    )
-    for path in candidates:
-        if os.path.isfile(path):
-            return ImageFont.truetype(path, size)
-    # Last resort: Pillow built-in (bitmap, not great but works)
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size)
-    except Exception:
-        return ImageFont.load_default()
-
-
-def _draw_rounded_rect(
-    draw: ImageDraw.ImageDraw,
-    xy: tuple[int, int, int, int],
-    radius: int,
-    fill: tuple,
-) -> None:
-    """Draw a rounded rectangle."""
-    x0, y0, x1, y1 = xy
-    draw.rounded_rectangle(xy, radius=radius, fill=fill)
-
-
-def _draw_coffee_decorations(draw: ImageDraw.ImageDraw) -> None:
-    """Draw subtle coffee-themed decorations on the card."""
-    # Steam wisps at top-right
-    for i, offset in enumerate([(690, 40), (720, 30), (710, 55)]):
-        alpha = 140 - i * 30
-        col = (ACCENT[0], ACCENT[1], ACCENT[2])
-        draw.ellipse(
-            (offset[0], offset[1], offset[0] + 14, offset[1] + 28),
-            fill=None,
-            outline=col,
-            width=2,
-        )
-    # Coffee beans (small ovals) scattered
-    bean_positions = [(40, 900), (750, 880), (60, 50), (730, 500)]
-    for bx, by in bean_positions:
-        draw.ellipse((bx, by, bx + 18, by + 12), fill=ACCENT)
-        draw.line((bx + 4, by + 2, bx + 14, by + 10), fill=BG_TOP, width=1)
-    # Mug silhouette bottom-left
-    draw.rounded_rectangle((30, 920, 80, 970), radius=6, fill=ACCENT)
-    draw.rectangle((80, 935, 95, 958), fill=ACCENT)
-    # Small ring for mug handle
-    draw.arc((78, 932, 100, 960), 270, 90, fill=ACCENT, width=3)
-
-
-def _fit_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
-    """Shorten text with '…' if it exceeds max_width."""
-    if not text:
-        return ""
-    if font.getlength(text) <= max_width:
-        return text
-    for end in range(len(text) - 1, 0, -1):
-        candidate = text[:end].rstrip() + "…"
-        if font.getlength(candidate) <= max_width:
-            return candidate
-    return text[:10] + "…"
-
-
-def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-    """Word-wrap text to fit within max_width, returns list of lines."""
-    words = text.split()
-    lines: list[str] = []
-    current = ""
-    for w in words:
-        test = f"{current} {w}".strip()
-        if font.getlength(test) <= max_width:
-            current = test
-        else:
-            if current:
-                lines.append(current)
-            current = w
-    if current:
-        lines.append(current)
-    return lines or [""]
+COFFEE_MUG_SVG = """
+<svg viewBox="0 0 200 220" xmlns="http://www.w3.org/2000/svg">
+  <path d="M75 65 Q78 45 72 28 Q68 15 75 2" fill="none" stroke="#c8956c" stroke-width="3" stroke-linecap="round" opacity="0.7">
+    <animate attributeName="d" dur="3s" repeatCount="indefinite"
+      values="M75 65 Q78 45 72 28 Q68 15 75 2;M75 65 Q70 45 76 28 Q80 15 73 2;M75 65 Q78 45 72 28 Q68 15 75 2"/>
+  </path>
+  <path d="M100 58 Q104 38 98 20 Q94 8 100 -5" fill="none" stroke="#c8956c" stroke-width="3" stroke-linecap="round" opacity="0.5">
+    <animate attributeName="d" dur="2.5s" repeatCount="indefinite"
+      values="M100 58 Q104 38 98 20 Q94 8 100 -5;M100 58 Q96 38 102 20 Q106 8 99 -5;M100 58 Q104 38 98 20 Q94 8 100 -5"/>
+  </path>
+  <path d="M125 62 Q128 42 122 25 Q118 12 125 0" fill="none" stroke="#c8956c" stroke-width="3" stroke-linecap="round" opacity="0.6">
+    <animate attributeName="d" dur="3.5s" repeatCount="indefinite"
+      values="M125 62 Q128 42 122 25 Q118 12 125 0;M125 62 Q122 42 128 25 Q132 12 124 0;M125 62 Q128 42 122 25 Q118 12 125 0"/>
+  </path>
+  <path d="M45 75 L45 150 Q45 175 70 175 L130 175 Q155 175 155 150 L155 75 Z"
+        fill="#f0f0f0" stroke="#e0e0e0" stroke-width="1"/>
+  <ellipse cx="100" cy="85" rx="50" ry="12" fill="#8B6544"/>
+  <ellipse cx="100" cy="85" rx="50" ry="12" fill="url(#coffeeGrad)" opacity="0.6"/>
+  <ellipse cx="82" cy="84" rx="6" ry="4" fill="#5C3D2E" opacity="0.5" transform="rotate(-15 82 84)"/>
+  <ellipse cx="115" cy="86" rx="5" ry="3.5" fill="#5C3D2E" opacity="0.4" transform="rotate(10 115 86)"/>
+  <ellipse cx="100" cy="75" rx="55" ry="12" fill="none" stroke="#ffffff" stroke-width="2" opacity="0.8"/>
+  <ellipse cx="100" cy="75" rx="55" ry="12" fill="none" stroke="#d0d0d0" stroke-width="1"/>
+  <path d="M155 95 Q185 95 185 125 Q185 155 155 155"
+        fill="none" stroke="#f0f0f0" stroke-width="8" stroke-linecap="round"/>
+  <path d="M155 95 Q185 95 185 125 Q185 155 155 155"
+        fill="none" stroke="#e8e8e8" stroke-width="6" stroke-linecap="round"/>
+  <path d="M45 75 L45 150 Q45 175 70 175 L130 175 Q155 175 155 150 L155 75 Z"
+        fill="url(#cupShade)" opacity="0.15"/>
+  <g transform="translate(70, 105)" opacity="0.25">
+    <rect x="0" y="20" width="4" height="25" fill="#141820"/>
+    <line x1="2" y1="15" x2="2" y2="50" stroke="#141820" stroke-width="1"/>
+    <rect x="12" y="10" width="4" height="20" fill="#141820"/>
+    <line x1="14" y1="5" x2="14" y2="35" stroke="#141820" stroke-width="1"/>
+    <rect x="24" y="25" width="4" height="15" fill="#141820"/>
+    <line x1="26" y1="18" x2="26" y2="45" stroke="#141820" stroke-width="1"/>
+    <rect x="36" y="5" width="4" height="30" fill="#141820"/>
+    <line x1="38" y1="0" x2="38" y2="40" stroke="#141820" stroke-width="1"/>
+    <rect x="48" y="15" width="4" height="20" fill="#141820"/>
+    <line x1="50" y1="8" x2="50" y2="40" stroke="#141820" stroke-width="1"/>
+  </g>
+  <ellipse cx="100" cy="180" rx="75" ry="14" fill="#e8e8e8"/>
+  <ellipse cx="100" cy="180" rx="75" ry="14" fill="none" stroke="#d0d0d0" stroke-width="1"/>
+  <ellipse cx="100" cy="177" rx="55" ry="8" fill="none" stroke="#d8d8d8" stroke-width="1" opacity="0.5"/>
+  <ellipse cx="100" cy="195" rx="60" ry="6" fill="#c8956c" opacity="0.04"/>
+  <defs>
+    <linearGradient id="coffeeGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#6B4226"/>
+      <stop offset="50%" stop-color="#9B7044"/>
+      <stop offset="100%" stop-color="#6B4226"/>
+    </linearGradient>
+    <linearGradient id="cupShade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#000"/>
+      <stop offset="50%" stop-color="transparent"/>
+      <stop offset="100%" stop-color="#000"/>
+    </linearGradient>
+  </defs>
+</svg>
+"""
 
 
 def generate_coffee_card_image(
@@ -365,146 +327,151 @@ def generate_coffee_card_image(
     x_mult: float,
     call_type: str,
     brewed_on: str,
+    called_at_mcap: str = "",
+    ath_mcap: str = "",
 ) -> io.BytesIO:
     """
-    Generate a premium coffee-themed 'Coffee Card' PNG.
-    Returns a BytesIO buffer ready for Telegram send_photo.
+    Generate a TradingBrew-branded Coffee Card PNG via Playwright.
+    Renders at 2× device scale for crisp 2000×1200 output.
     """
-    img = Image.new("RGB", (CARD_W, CARD_H), BG_TOP)
-    draw = ImageDraw.ImageDraw(img)
+    is_profit = x_mult >= 1.0
+    bg = "#141820"
+    brown = "#c8956c"
+    brown_glow = "rgba(200,149,108,0.35)"
+    brown_dim = "rgba(200,149,108,0.15)"
+    white = "#f0f0f0"
+    red = "#e05252"
+    red_glow = "rgba(224,82,82,0.35)"
 
-    # Gradient background
-    for y in range(CARD_H):
-        t = y / CARD_H
-        r = int(BG_TOP[0] * (1 - t) + BG_BOT[0] * t)
-        g = int(BG_TOP[1] * (1 - t) + BG_BOT[1] * t)
-        b = int(BG_TOP[2] * (1 - t) + BG_BOT[2] * t)
-        draw.line([(0, y), (CARD_W, y)], fill=(r, g, b))
+    accent = brown if is_profit else red
+    accent_glow = brown_glow if is_profit else red_glow
+    accent_dim = brown_dim if is_profit else "rgba(224,82,82,0.15)"
 
-    # Inner card panel
-    _draw_rounded_rect(draw, (30, 25, CARD_W - 30, CARD_H - 25), 24, (50, 35, 26))
-    # Thin accent border inside
-    draw.rounded_rectangle(
-        (32, 27, CARD_W - 32, CARD_H - 27), radius=23, outline=ACCENT, width=2
-    )
+    badge_label = "ALPHA" if call_type != "gamble" else "GAMBLE"
+    badge_color = brown if call_type != "gamble" else "#e0a030"
 
-    # Coffee decorations
-    _draw_coffee_decorations(draw)
-
-    # Fonts
-    font_ticker = _load_font(52, bold=True)
-    font_name = _load_font(24, bold=False)
-    font_ca = _load_font(14, bold=False)
-    font_label = _load_font(18, bold=True)
-    font_value = _load_font(22, bold=False)
-    font_xmult = _load_font(72, bold=True)
-    font_pct = _load_font(40, bold=True)
-    font_type_badge = _load_font(20, bold=True)
-    font_thesis = _load_font(17, bold=False)
-    font_brewed = _load_font(16, bold=False)
-    font_header = _load_font(16, bold=True)
-    font_watermark = _load_font(14, bold=False)
-
-    y_cursor = 55
-
-    # Header line
-    header_text = "☕ Coffee Card"
-    draw.text((60, y_cursor), header_text, fill=ACCENT, font=font_label)
-    y_cursor += 36
-
-    # Divider
-    draw.line([(60, y_cursor), (CARD_W - 60, y_cursor)], fill=ACCENT, width=1)
-    y_cursor += 18
-
-    # Ticker (large)
-    ticker_display = f"${ticker.upper()}"
-    draw.text((60, y_cursor), ticker_display, fill=CREAM, font=font_ticker)
-    y_cursor += 62
-
-    # Token name
-    draw.text((62, y_cursor), token_name, fill=MUTED, font=font_name)
-    y_cursor += 34
-
-    # Contract address (full, small, monospace-ish)
-    ca_display = ca
-    draw.text((62, y_cursor), ca_display, fill=MUTED, font=font_ca)
-    y_cursor += 28
-
-    # Divider
-    draw.line([(60, y_cursor), (CARD_W - 60, y_cursor)], fill=(70, 55, 42), width=1)
-    y_cursor += 16
-
-    # Call type badge
-    badge_text = "GAMBLE 🎲" if call_type == "gamble" else "ALPHA 🏆"
-    badge_color = (180, 130, 60) if call_type == "gamble" else (80, 180, 130)
-    badge_w = int(font_type_badge.getlength(badge_text)) + 28
-    _draw_rounded_rect(
-        draw, (60, y_cursor, 60 + badge_w, y_cursor + 34), 8, badge_color
-    )
-    draw.text(
-        (74, y_cursor + 5), badge_text, fill=(255, 255, 255), font=font_type_badge
-    )
-
-    # Username next to badge
-    user_display = f"@{username}" if username else "Anonymous"
-    draw.text(
-        (80 + badge_w, y_cursor + 7), user_display, fill=ACCENT, font=font_value
-    )
-    y_cursor += 50
-
-    # X Multiplier — BIG and prominent
-    x_color = GREEN if x_mult >= 1.0 else RED
-    x_text = f"{x_mult:.1f}x"
-    draw.text((60, y_cursor), x_text, fill=x_color, font=font_xmult)
-
-    # % Gain next to x
-    pct_color = GREEN if pct_gain >= 0 else RED
     sign = "+" if pct_gain >= 0 else ""
-    pct_text = f"{sign}{pct_gain:.1f}%"
-    draw.text((380, y_cursor + 20), pct_text, fill=pct_color, font=font_pct)
-    y_cursor += 100
+    ca_short = ca[:12] + "..." + ca[-8:] if len(ca) > 24 else ca
 
-    # Divider
-    draw.line([(60, y_cursor), (CARD_W - 60, y_cursor)], fill=(70, 55, 42), width=1)
-    y_cursor += 16
+    page_html = f"""<!DOCTYPE html>
+<html>
+<head>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{
+    width: {CARD_W}px; height: {CARD_H}px; overflow: hidden;
+    background: {bg}; font-family: 'Inter', 'Space Grotesk', sans-serif;
+  }}
+  .bg {{
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(ellipse 55% 50% at 0% 100%, rgba(200,149,108,0.04) 0%, transparent 70%),
+      radial-gradient(ellipse 45% 55% at 100% 0%, rgba(200,149,108,0.03) 0%, transparent 60%),
+      linear-gradient(180deg, #161c26 0%, #111620 50%, #0e1218 100%);
+  }}
+  .card {{
+    position: absolute; top: 16px; left: 16px; right: 16px; bottom: 16px;
+    border: 1.5px solid rgba(200,149,108,0.2); border-radius: 16px;
+    overflow: hidden; display: flex; flex-direction: column;
+    padding: 28px 40px 24px;
+  }}
+  .topbar {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 4px; z-index: 10; }}
+  .brand-area {{ display: flex; flex-direction: column; gap: 2px; }}
+  .brand-label {{ font-size: 11px; font-weight: 600; color: rgba(240,240,240,0.4); letter-spacing: 3px; text-transform: uppercase; }}
+  .brand-name {{ font-family: 'Space Grotesk', sans-serif; font-size: 24px; font-weight: 700; letter-spacing: 0.5px; }}
+  .brand-name .part1 {{ color: {white}; }}
+  .brand-name .part2 {{ color: {brown}; }}
+  .call-badge {{ font-size: 11px; font-weight: 700; color: {badge_color}; letter-spacing: 2px; border: 1px solid {badge_color}; padding: 5px 16px; border-radius: 4px; text-transform: uppercase; }}
+  .main {{ flex: 1; display: flex; gap: 0; z-index: 10; }}
+  .left {{ flex: 0 0 360px; display: flex; flex-direction: column; justify-content: center; }}
+  .divider {{ width: 40px; height: 2px; background: {brown}; opacity: 0.5; margin: 6px 0; box-shadow: 0 0 8px {brown_glow}; }}
+  .ticker {{ font-family: 'Space Grotesk', sans-serif; font-size: 82px; font-weight: 700; color: {white}; line-height: 0.95; letter-spacing: -1px; }}
+  .ca {{ font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 500; color: rgba(240,240,240,0.3); margin-top: 4px; }}
+  .growth-label {{ font-size: 12px; font-weight: 600; color: rgba(240,240,240,0.4); letter-spacing: 3px; text-transform: uppercase; margin-top: 18px; }}
+  .growth-value {{ font-family: 'Space Grotesk', sans-serif; font-size: 78px; font-weight: 700; color: {accent}; line-height: 1; letter-spacing: -2px; text-shadow: 0 0 30px {accent_glow}, 0 0 60px {accent_dim}; }}
+  .center {{ flex: 0 0 220px; display: flex; align-items: center; justify-content: center; }}
+  .mug {{ width: 180px; height: 200px; opacity: 0.85; filter: drop-shadow(0 4px 20px rgba(200,149,108,0.1)); }}
+  .right {{ flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: flex-end; gap: 20px; text-align: right; }}
+  .data-item {{ display: flex; flex-direction: column; gap: 2px; align-items: flex-end; }}
+  .data-label {{ font-size: 12px; font-weight: 600; color: rgba(240,240,240,0.35); letter-spacing: 2.5px; text-transform: uppercase; }}
+  .data-value {{ font-family: 'Space Grotesk', sans-serif; font-size: 36px; font-weight: 700; color: {accent}; letter-spacing: 0.5px; }}
+  .data-value.white {{ color: {white}; }}
+  .bottombar {{ display: flex; justify-content: space-between; align-items: flex-end; margin-top: auto; padding-top: 12px; z-index: 10; }}
+  .powered {{ display: flex; align-items: center; gap: 8px; background: rgba(200,149,108,0.08); border: 1px solid rgba(200,149,108,0.18); border-radius: 20px; padding: 6px 20px; }}
+  .powered-label {{ font-size: 11px; font-weight: 600; color: rgba(240,240,240,0.45); letter-spacing: 2px; text-transform: uppercase; }}
+  .powered-name {{ font-family: 'Space Grotesk', sans-serif; font-size: 14px; font-weight: 700; }}
+  .powered-name .t {{ color: {white}; }}
+  .powered-name .b {{ color: {brown}; }}
+  .called-by {{ text-align: right; }}
+  .called-by-label {{ font-size: 11px; font-weight: 600; color: rgba(240,240,240,0.35); letter-spacing: 2px; text-transform: uppercase; }}
+  .called-by-name {{ font-family: 'Space Grotesk', sans-serif; font-size: 28px; font-weight: 700; color: {white}; }}
+</style>
+</head>
+<body>
+<div class="bg"></div>
+<div class="card">
+  <div class="topbar">
+    <div class="brand-area">
+      <div class="brand-label">BREWED WITH</div>
+      <div class="brand-name"><span class="part1">Brew</span><span class="part2">Bot</span></div>
+    </div>
+    <div class="call-badge">{_e(badge_label)}</div>
+  </div>
+  <div class="main">
+    <div class="left">
+      <div class="divider"></div>
+      <div class="ticker">{_e(ticker.upper())}</div>
+      <div class="ca">{_e(ca_short)}</div>
+      <div class="growth-label">GROWTH</div>
+      <div class="growth-value">{sign}{pct_gain:.0f}%</div>
+    </div>
+    <div class="center">
+      <div class="mug">{COFFEE_MUG_SVG}</div>
+    </div>
+    <div class="right">
+      <div class="data-item">
+        <div class="data-label">CALLED AT</div>
+        <div class="data-value">{_e(called_at_mcap or 'N/A')}</div>
+      </div>
+      <div class="data-item">
+        <div class="data-label">ATH POST CALL</div>
+        <div class="data-value">{_e(ath_mcap or 'N/A')}</div>
+      </div>
+      <div class="data-item">
+        <div class="data-label">DATE CALLED</div>
+        <div class="data-value white">{_e(brewed_on)}</div>
+      </div>
+    </div>
+  </div>
+  <div class="bottombar">
+    <div class="powered">
+      <span class="powered-label">POWERED BY</span>
+      <span class="powered-name"><span class="t">Trading</span><span class="b">Brew</span></span>
+    </div>
+    <div class="called-by">
+      <div class="called-by-label">CALLED BY</div>
+      <div class="called-by-name">@{_e(username or 'Anon')}</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>"""
 
-    # Thesis section
-    draw.text((60, y_cursor), "THESIS", fill=ACCENT, font=font_header)
-    y_cursor += 26
-    thesis_lines = _wrap_text(thesis, font_thesis, CARD_W - 140)
-    max_thesis_lines = 6
-    for i, line in enumerate(thesis_lines[:max_thesis_lines]):
-        if i == max_thesis_lines - 1 and len(thesis_lines) > max_thesis_lines:
-            line = _fit_text(line, font_thesis, CARD_W - 140)
-            if not line.endswith("…"):
-                line += "…"
-        draw.text((62, y_cursor), line, fill=CREAM, font=font_thesis)
-        y_cursor += 24
-    y_cursor += 12
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(
+            viewport={"width": CARD_W, "height": CARD_H},
+            device_scale_factor=2,
+        )
+        page.set_content(page_html, wait_until="networkidle")
+        page.wait_for_timeout(2500)
+        screenshot = page.screenshot(type="png")
+        browser.close()
 
-    # Divider
-    draw.line([(60, y_cursor), (CARD_W - 60, y_cursor)], fill=(70, 55, 42), width=1)
-    y_cursor += 16
-
-    # Brewed on
-    draw.text((60, y_cursor), "BREWED ON", fill=ACCENT, font=font_header)
-    y_cursor += 24
-    draw.text((62, y_cursor), brewed_on, fill=CREAM, font=font_value)
-    y_cursor += 40
-
-    # Watermark / branding at bottom
-    wm_text = "☕ TheBrewBot — @TradingBrew"
-    wm_w = font_watermark.getlength(wm_text)
-    draw.text(
-        ((CARD_W - wm_w) / 2, CARD_H - 60),
-        wm_text,
-        fill=MUTED,
-        font=font_watermark,
-    )
-
-    # Export
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    buf = io.BytesIO(screenshot)
     buf.seek(0)
     return buf
 
@@ -814,11 +781,15 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Parse timestamp for "Brewed on"
     try:
         ts = datetime.fromisoformat(call["timestamp"])
-        brewed_on = ts.strftime("%b %d, %Y at %H:%M UTC")
+        brewed_on = ts.strftime("%b %d, %Y")
     except Exception:
         brewed_on = call["timestamp"]
 
     username = call["username"]
+
+    # Format mcap values for the card
+    called_at_mcap = fmt_usd(initial_mc)
+    ath_mcap = fmt_usd(current_mc) if x_mult >= 1 else fmt_usd(initial_mc)
 
     # Generate Coffee Card
     card_buf = generate_coffee_card_image(
@@ -831,6 +802,8 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         x_mult=x_mult,
         call_type=call["call_type"],
         brewed_on=brewed_on,
+        called_at_mcap=called_at_mcap,
+        ath_mcap=ath_mcap,
     )
 
     caption = generate_caption(username, x_mult, pct_gain)
