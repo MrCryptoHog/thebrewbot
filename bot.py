@@ -449,7 +449,8 @@ def generate_coffee_card_image(
   .ticker {{ font-family: 'Space Grotesk', sans-serif; font-size: 82px; font-weight: 700; color: {white}; line-height: 0.95; letter-spacing: -1px; }}
   .ca {{ font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 500; color: rgba(240,240,240,0.3); margin-top: 4px; }}
   .growth-label {{ font-size: 12px; font-weight: 600; color: rgba(240,240,240,0.4); letter-spacing: 3px; text-transform: uppercase; margin-top: 18px; }}
-  .growth-value {{ font-family: 'Space Grotesk', sans-serif; font-size: 78px; font-weight: 700; color: {accent}; line-height: 1; letter-spacing: -2px; text-shadow: 0 0 30px {accent_glow}, 0 0 60px {accent_dim}; }}
+  .growth-value {{ font-family: 'Space Grotesk', sans-serif; font-size: 72px; font-weight: 700; color: {accent}; line-height: 1; letter-spacing: -2px; text-shadow: 0 0 30px {accent_glow}, 0 0 60px {accent_dim}; display: flex; align-items: baseline; gap: 8px; }}
+  .growth-value .pct {{ font-size: 28px; font-weight: 600; opacity: 0.7; }}
   .center {{ flex: 0 0 220px; display: flex; align-items: center; justify-content: center; }}
   .mug {{ width: 180px; height: 200px; opacity: 0.85; filter: drop-shadow(0 4px 20px rgba(200,149,108,0.1)); }}
   .right {{ flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: flex-end; gap: 20px; text-align: right; }}
@@ -484,7 +485,7 @@ def generate_coffee_card_image(
       <div class="ticker">{_e(ticker.upper())}</div>
       <div class="ca">{_e(ca_short)}</div>
       <div class="growth-label">GROWTH</div>
-      <div class="growth-value">{sign}{pct_gain:.0f}%</div>
+      <div class="growth-value">{x_mult:.1f}x <span class="pct">({sign}{pct_gain:.0f}%)</span></div>
     </div>
     <div class="center">
       <div class="mug">{COFFEE_MUG_SVG}</div>
