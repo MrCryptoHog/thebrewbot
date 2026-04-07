@@ -784,6 +784,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     text = update.message.text
+
+    # Ignore messages mentioning @HeyTB_bot — those are for a different bot
+    if "@heytb_bot" in text.lower():
+        return
+
     ca = detect_ca(text)
     if not ca:
         return
