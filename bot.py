@@ -697,30 +697,41 @@ def format_cafeboard(entries: list[dict]) -> str:
 # =========================================================================
 def generate_caption(username: str, x_mult: float, pct_gain: float) -> str:
     """Build a warm coffee-themed caption for the Coffee Card photo."""
+    # Pick a coffee-accurate shot name based on the x multiplier
     if x_mult >= 10:
         compliment = (
-            f"☕ Brewed to perfection! Your call just hit {x_mult:.1f}x "
-            f"— you're the real alpha barista of the café! 🔥"
+            f"☕ Brewed to perfection! {x_mult:.1f}x "
+            f"— @{username} is the real alpha barista of the café! 🔥"
         )
     elif x_mult >= 5:
         compliment = (
-            f"☕ Now that's a strong brew! {x_mult:.1f}x gains — "
-            f"the café smells like pure alpha today! 🔥"
+            f"☕ Now that's an extra-strong brew! {x_mult:.1f}x gains — "
+            f"the café smells like pure alpha thanks to @{username}! 🔥"
+        )
+    elif x_mult >= 4:
+        compliment = (
+            f"☕ A solid quad shot! {x_mult:.1f}x — "
+            f"your portfolio is on fire @{username}! 🔥"
+        )
+    elif x_mult >= 3:
+        compliment = (
+            f"☕ A solid triple shot! {x_mult:.1f}x — "
+            f"your portfolio is steaming nicely @{username}! ☕"
         )
     elif x_mult >= 2:
         compliment = (
             f"☕ A solid double shot! {x_mult:.1f}x — "
-            f"your portfolio is steaming nicely! ☕"
+            f"your portfolio is warming up @{username}! ☕"
         )
     elif x_mult >= 1:
         compliment = (
             f"☕ The brew is warming up! {x_mult:.1f}x so far — "
-            f"keep that grinder going, @{username}! ☕"
+            f"keep that grinder going @{username}! ☕"
         )
     else:
         compliment = (
             f"☕ Even the best baristas have off-days. {x_mult:.1f}x for now — "
-            f"the next cup will be stronger, @{username}! 💪"
+            f"the next cup will be stronger @{username}! 💪"
         )
 
     promo = (
