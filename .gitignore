@@ -1,8 +1,12 @@
 __pycache__/
 *.pyc
+*.pyo
 .env
-cafebot.db
+*.db
 *.db-wal
 *.db-shm
-venv/
 .venv/
+venv/
+dist/
+build/
+*.egg-info/
