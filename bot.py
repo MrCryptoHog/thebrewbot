@@ -103,6 +103,59 @@ def init_db() -> None:
     logger.info("Database initialized at %s", DB_PATH)
 
 
+def seed_restored_calls() -> None:
+    """One-time restore of calls lost during the accidental deployment incident."""
+    CHAT_ID = -1003575636670
+    restored = [
+        {
+            "username": "MrOK_777",
+            "ca": "0x8e729198d1C59B82bd6bBa579310C40d740A11C2",
+            "thesis": "Alvara ($ALVA)",
+            "call_type": "alpha",
+            "initial_mc": 1_690_000.0,
+            "timestamp": "2026-04-07T15:06:00+00:00",  # 16:06 UK (BST = UTC+1)
+        },
+        {
+            "username": "DonPJalapeno",
+            "ca": "9JbxQSKNukRA7cPZxCfhSNEcAP9iKRo3PSyYNbW4pump",
+            "thesis": "Momo ($MOMO)",
+            "call_type": "alpha",
+            "initial_mc": 51_970.0,
+            "timestamp": "2026-04-07T13:58:00+00:00",  # 14:58 UK (BST = UTC+1)
+        },
+    ]
+    with _get_db() as conn:
+        for r in restored:
+            existing = conn.execute(
+                "SELECT 1 FROM calls WHERE chat_id=? AND LOWER(ca)=LOWER(?) LIMIT 1",
+                (CHAT_ID, r["ca"]),
+            ).fetchone()
+            if existing:
+                continue
+            # Use negative hash of username as temp user_id until real user interacts
+            temp_uid = -(abs(hash(r["username"])) % (10**9))
+            conn.execute(
+                "INSERT INTO calls (chat_id, user_id, username, ca, thesis, call_type, initial_mc, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (CHAT_ID, temp_uid, r["username"], r["ca"], r["thesis"],
+                 r["call_type"], r["initial_mc"], r["timestamp"]),
+            )
+            logger.info("Restored call: @%s — %s", r["username"], r["ca"])
+        conn.commit()
+
+
+def reconcile_username(real_user_id: int, username: str) -> None:
+    """If a user has restored records with a temp user_id, update them to the real ID."""
+    if not username:
+        return
+    with _get_db() as conn:
+        conn.execute(
+            "UPDATE calls SET user_id=? WHERE user_id < 0 AND LOWER(username)=LOWER(?)",
+            (real_user_id, username),
+        )
+        conn.commit()
+
+
 def insert_call(
     chat_id: int,
     user_id: int,
@@ -785,6 +838,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not chat or chat.type in ("private",):
         return
 
+    # Reconcile temp user_ids from restored data
+    user = update.message.from_user
+    if user and user.username:
+        reconcile_username(user.id, user.username)
+
     text = update.message.text
 
     # Ignore messages mentioning @HeyTB_bot — those are for a different bot
@@ -1069,6 +1127,7 @@ def main() -> None:
         return
 
     init_db()
+    seed_restored_calls()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
