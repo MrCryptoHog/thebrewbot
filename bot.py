@@ -664,6 +664,7 @@ def calculate_cafeboard(chat_id: int) -> list[dict]:
         best_x = 0.0
         best_username = ucalls[0]["username"]
         best_ticker = ""
+        best_call_type = ucalls[0].get("call_type", "alpha")
         for c in ucalls:
             dex = get_dexscreener_data(c["ca"])
             if dex and c["initial_mc"] > 0:
@@ -672,8 +673,9 @@ def calculate_cafeboard(chat_id: int) -> list[dict]:
                     best_x = cur_x
                     best_username = c["username"]
                     best_ticker = dex.get("symbol", "")
+                    best_call_type = c.get("call_type", "alpha")
         if best_x > 0:
-            results.append({"username": best_username, "best_x": best_x, "ticker": best_ticker})
+            results.append({"username": best_username, "best_x": best_x, "ticker": best_ticker, "call_type": best_call_type})
 
     results.sort(key=lambda r: r["best_x"], reverse=True)
     return results[:TOP_N]
@@ -686,9 +688,9 @@ def format_cafeboard(entries: list[dict]) -> str:
 
     lines = ["🏆 Cafeboard ☕\n"]
     for i, e in enumerate(entries, 1):
-        fire = " 🔥" if i <= 3 else ""
+        emoji = " 🏆" if e.get("call_type") != "gamble" else " 🎲"
         ticker = f" ${e['ticker']}" if e.get('ticker') else ""
-        lines.append(f"{i}. @{e['username']} — {e['best_x']:.1f}x{ticker}{fire}")
+        lines.append(f"{i}. @{e['username']} — {e['best_x']:.1f}x{ticker}{emoji}")
     return "\n".join(lines)
 
 
