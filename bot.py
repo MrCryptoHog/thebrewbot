@@ -5,6 +5,7 @@ A cozy crypto-café Telegram bot that lets users "brew" calls and flex gains.
 Python 3.11+ | python-telegram-bot 20.x | SQLite | Playwright | DexScreener
 """
 
+import asyncio
 import os
 import re
 import io
@@ -1035,9 +1036,17 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message:
         return
     chat = update.effective_chat
-    if not chat or chat.type == "private":
+    user = update.message.from_user
+
+    # Allow DMs from owner (look up call in the main group)
+    OWNER_ID = 5063218911
+    MAIN_GROUP = -1003575636670
+    is_dm = chat and chat.type == "private"
+    if is_dm and (not user or user.id != OWNER_ID):
         await update.message.reply_text("☕ Use /pnl in a group chat!")
         return
+
+    lookup_chat_id = MAIN_GROUP if is_dm else (chat.id if chat else 0)
 
     text = update.message.text or ""
     ca = detect_ca(text)
@@ -1047,11 +1056,10 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    logger.info("/pnl invoked in chat=%s ca=%s", chat.id, ca)
-    user = update.message.from_user
-    call = get_any_call(chat.id, ca)
+    logger.info("/pnl invoked in chat=%s (lookup=%s) ca=%s", chat.id if chat else 'dm', lookup_chat_id, ca)
+    call = get_any_call(lookup_chat_id, ca)
     if not call:
-        logger.info("/pnl — no call found for chat=%s ca=%s", chat.id, ca)
+        logger.info("/pnl — no call found for lookup_chat=%s ca=%s", lookup_chat_id, ca)
         await update.message.reply_text(
             "☕ No brewed call found for that token in this chat. "
             "Share a CA with your thesis first!"
@@ -1095,7 +1103,8 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Generate Coffee Card
     logger.info("Generating PnL card for @%s — %s (x=%.1f)", username, dex["symbol"], x_mult)
     try:
-        card_buf = generate_coffee_card_image(
+        card_buf = await asyncio.to_thread(
+            generate_coffee_card_image,
             ticker=dex["symbol"],
             token_name=dex["name"],
             ca=ca,
