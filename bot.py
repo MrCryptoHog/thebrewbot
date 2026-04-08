@@ -193,6 +193,16 @@ def get_user_call(chat_id: int, user_id: int, ca: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def get_any_call(chat_id: int, ca: str) -> Optional[dict]:
+    """Fetch the first call for this CA in a chat, regardless of who made it."""
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM calls WHERE chat_id=? AND LOWER(ca)=LOWER(?) ORDER BY id ASC LIMIT 1",
+            (chat_id, ca),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def get_chat_calls(chat_id: int) -> list[dict]:
     with _get_db() as conn:
         rows = conn.execute(
@@ -613,6 +623,7 @@ def calculate_cafeboard(chat_id: int) -> list[dict]:
     for uid, ucalls in user_calls.items():
         best_x = 0.0
         best_username = ucalls[0]["username"]
+        best_ticker = ""
         for c in ucalls:
             dex = get_dexscreener_data(c["ca"])
             if dex and c["initial_mc"] > 0:
@@ -620,8 +631,9 @@ def calculate_cafeboard(chat_id: int) -> list[dict]:
                 if cur_x > best_x:
                     best_x = cur_x
                     best_username = c["username"]
+                    best_ticker = dex.get("symbol", "")
         if best_x > 0:
-            results.append({"username": best_username, "best_x": best_x})
+            results.append({"username": best_username, "best_x": best_x, "ticker": best_ticker})
 
     results.sort(key=lambda r: r["best_x"], reverse=True)
     return results[:TOP_N]
@@ -635,7 +647,8 @@ def format_cafeboard(entries: list[dict]) -> str:
     lines = ["🏆 Cafeboard ☕\n"]
     for i, e in enumerate(entries, 1):
         fire = " 🔥" if i <= 3 else ""
-        lines.append(f"{i}. @{e['username']} — {e['best_x']:.1f}x{fire}")
+        ticker = f" ${e['ticker']}" if e.get('ticker') else ""
+        lines.append(f"{i}. @{e['username']} — {e['best_x']:.1f}x{ticker}{fire}")
     return "\n".join(lines)
 
 
@@ -996,7 +1009,7 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     user = update.message.from_user
-    call = get_user_call(chat.id, user.id, ca)
+    call = get_any_call(chat.id, ca)
     if not call:
         await update.message.reply_text(
             "☕ No brewed call found for that token in this chat. "
