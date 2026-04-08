@@ -100,6 +100,17 @@ def init_db() -> None:
             """
         )
         conn.commit()
+
+    # Migration: add peak_mc column if missing
+    with _get_db() as conn:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(calls)").fetchall()]
+        if "peak_mc" not in cols:
+            conn.execute("ALTER TABLE calls ADD COLUMN peak_mc REAL NOT NULL DEFAULT 0")
+            # Seed peak_mc from initial_mc for existing rows
+            conn.execute("UPDATE calls SET peak_mc = initial_mc WHERE peak_mc = 0")
+            conn.commit()
+            logger.info("Migration: added peak_mc column to calls table")
+
     logger.info("Database initialized at %s", DB_PATH)
 
 
@@ -201,6 +212,16 @@ def get_any_call(chat_id: int, ca: str) -> Optional[dict]:
             (chat_id, ca),
         ).fetchone()
     return dict(row) if row else None
+
+
+def update_peak_mc(call_id: int, new_peak: float) -> None:
+    """Update peak_mc for a call if the new value is higher."""
+    with _get_db() as conn:
+        conn.execute(
+            "UPDATE calls SET peak_mc = ? WHERE id = ? AND ? > peak_mc",
+            (new_peak, call_id, new_peak),
+        )
+        conn.commit()
 
 
 def get_chat_calls(chat_id: int) -> list[dict]:
@@ -1031,7 +1052,11 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("☕ Initial market cap was zero — can't calculate PnL!")
         return
 
-    x_mult = current_mc / initial_mc
+    # Update peak_mc if current FDV is a new high
+    update_peak_mc(call["id"], current_mc)
+    peak_mc = max(call.get("peak_mc", 0) or 0, current_mc)
+
+    x_mult = peak_mc / initial_mc
     pct_gain = (x_mult - 1) * 100
 
     # Parse timestamp for "Brewed on" — short YYYY-MM-DD format
@@ -1045,7 +1070,7 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Format mcap values for the card (no $ sign)
     called_at_mcap = fmt_mcap(initial_mc)
-    ath_mcap = fmt_mcap(current_mc) if x_mult >= 1 else fmt_mcap(initial_mc)
+    ath_mcap = fmt_mcap(peak_mc)
 
     # Generate Coffee Card
     card_buf = generate_coffee_card_image(
