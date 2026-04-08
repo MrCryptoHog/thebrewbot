@@ -1,5 +1,4 @@
-aiogram>=3.4,<4
-aiosqlite>=0.19,<1
-aiohttp>=3.9,<4
-solders>=0.21,<1
+python-telegram-bot[job-queue]==20.*
+requests>=2.31,<3
+playwright>=1.40,<2
 python-dotenv>=1.0,<2
