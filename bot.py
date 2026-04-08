@@ -35,7 +35,9 @@ from telegram.ext import (
 # ---------------------------------------------------------------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cafebot.db")
+# Use persistent volume if available (/data on Railway), else fall back to local
+_data_dir = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(_data_dir, "cafebot.db")
 DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search?q={}"
 CACHE_TTL = 45  # seconds
 DAILY_INTERVAL = 86400  # 24 h in seconds
