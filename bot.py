@@ -155,6 +155,14 @@ def seed_restored_calls() -> None:
             logger.info("Restored call: @%s — %s", r["username"], r["ca"])
         conn.commit()
 
+    # One-time ATH correction: MOMO hit 228k but bot missed it
+    with _get_db() as conn:
+        conn.execute(
+            "UPDATE calls SET peak_mc = MAX(peak_mc, 228000.0) "
+            "WHERE LOWER(ca) = LOWER('9JbxQSKNukRA7cPZxCfhSNEcAP9iKRo3PSyYNbW4pump')",
+        )
+        conn.commit()
+
 
 def reconcile_username(real_user_id: int, username: str) -> None:
     """If a user has restored records with a temp user_id, update them to the real ID."""
@@ -668,7 +676,11 @@ def calculate_cafeboard(chat_id: int) -> list[dict]:
         for c in ucalls:
             dex = get_dexscreener_data(c["ca"])
             if dex and c["initial_mc"] > 0:
-                cur_x = dex["fdv"] / c["initial_mc"]
+                # Update peak_mc while we have fresh data
+                update_peak_mc(c["id"], dex["fdv"])
+                # Use ATH (peak_mc) for X, not current FDV
+                peak = max(c.get("peak_mc", 0) or 0, dex["fdv"])
+                cur_x = peak / c["initial_mc"]
                 if cur_x > best_x:
                     best_x = cur_x
                     best_username = c["username"]
@@ -1095,7 +1107,9 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Update peak_mc if current FDV is a new high
     update_peak_mc(call["id"], current_mc)
-    peak_mc = max(call.get("peak_mc", 0) or 0, current_mc)
+    # Re-read peak_mc from DB to get the true ATH (not the stale row we loaded earlier)
+    call_refreshed = get_any_call(lookup_chat_id, ca)
+    peak_mc = max(call_refreshed.get("peak_mc", 0) or 0 if call_refreshed else 0, current_mc)
 
     x_mult = peak_mc / initial_mc
     pct_gain = (x_mult - 1) * 100
