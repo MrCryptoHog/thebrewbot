@@ -461,6 +461,24 @@ COFFEE_MUG_SVG = """
 </svg>
 """
 
+# Track whether Playwright chromium is available
+_playwright_ok: bool = True
+
+
+def _check_playwright() -> bool:
+    """Quick Playwright startup check. Run once at boot."""
+    global _playwright_ok
+    try:
+        with sync_playwright() as p:
+            b = p.chromium.launch()
+            b.close()
+        logger.info("Playwright health check: chromium OK ✅")
+        return True
+    except Exception as exc:
+        logger.error("Playwright health check FAILED: %s", exc)
+        _playwright_ok = False
+        return False
+
 
 def generate_coffee_card_image(
     ticker: str,
@@ -1029,9 +1047,11 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    logger.info("/pnl invoked in chat=%s ca=%s", chat.id, ca)
     user = update.message.from_user
     call = get_any_call(chat.id, ca)
     if not call:
+        logger.info("/pnl — no call found for chat=%s ca=%s", chat.id, ca)
         await update.message.reply_text(
             "☕ No brewed call found for that token in this chat. "
             "Share a CA with your thesis first!"
@@ -1073,24 +1093,38 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     ath_mcap = fmt_mcap(peak_mc)
 
     # Generate Coffee Card
-    card_buf = generate_coffee_card_image(
-        ticker=dex["symbol"],
-        token_name=dex["name"],
-        ca=ca,
-        username=username,
-        thesis=call["thesis"],
-        pct_gain=pct_gain,
-        x_mult=x_mult,
-        call_type=call["call_type"],
-        brewed_on=brewed_on,
-        called_at_mcap=called_at_mcap,
-        ath_mcap=ath_mcap,
-    )
-
-    caption = generate_caption(username, x_mult, pct_gain)
-
-    await update.message.reply_photo(photo=card_buf, caption=caption)
-    logger.info("PnL card sent for user=%s ca=%s x=%.1f", username, ca, x_mult)
+    logger.info("Generating PnL card for @%s — %s (x=%.1f)", username, dex["symbol"], x_mult)
+    try:
+        card_buf = generate_coffee_card_image(
+            ticker=dex["symbol"],
+            token_name=dex["name"],
+            ca=ca,
+            username=username,
+            thesis=call["thesis"],
+            pct_gain=pct_gain,
+            x_mult=x_mult,
+            call_type=call["call_type"],
+            brewed_on=brewed_on,
+            called_at_mcap=called_at_mcap,
+            ath_mcap=ath_mcap,
+        )
+        caption = generate_caption(username, x_mult, pct_gain)
+        await update.message.reply_photo(photo=card_buf, caption=caption)
+        logger.info("PnL card sent for user=%s ca=%s x=%.1f", username, ca, x_mult)
+    except Exception as exc:
+        logger.error("Coffee card generation failed for %s: %s", ca, exc, exc_info=True)
+        # Fallback: send text-only PnL
+        sign = "+" if pct_gain >= 0 else ""
+        fallback = (
+            f"☕ Coffee Card (text fallback)\n\n"
+            f"Token: {dex['symbol']} ({dex['name']})\n"
+            f"Called by: @{username}\n"
+            f"Called at: {called_at_mcap}\n"
+            f"ATH: {ath_mcap}\n"
+            f"Growth: {x_mult:.1f}x ({sign}{pct_gain:.0f}%)\n\n"
+            f"⚠️ Image generation temporarily unavailable."
+        )
+        await update.message.reply_text(fallback)
 
 
 async def cafeboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1155,6 +1189,11 @@ async def daily_cafeboard_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Failed to post daily board to %s: %s", chat_id, exc)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log unhandled exceptions from handlers."""
+    logger.error("Unhandled exception: %s", context.error, exc_info=context.error)
+
+
 # =========================================================================
 # Main
 # =========================================================================
@@ -1166,6 +1205,7 @@ def main() -> None:
 
     init_db()
     seed_restored_calls()
+    _check_playwright()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -1188,6 +1228,9 @@ def main() -> None:
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, handle_message)
     )
+
+    # Error handler — log all unhandled exceptions
+    app.add_error_handler(error_handler)
 
     # Schedule daily cafeboard job (first run 24h after startup)
     job_queue = app.job_queue
