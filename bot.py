@@ -40,8 +40,21 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 _data_dir = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(_data_dir, "cafebot.db")
 DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search?q={}"
+DEXSCREENER_TOKEN_PAIRS = "https://api.dexscreener.com/token-pairs/v1/{chain}/{ca}"
+GECKO_OHLCV = "https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool}/ohlcv/{timeframe}"
+GECKO_NETWORK = {
+    "solana": "solana",
+    "ethereum": "eth",
+    "base": "base",
+    "bsc": "bsc",
+    "arbitrum": "arbitrum",
+    "polygon": "polygon_pos",
+    "optimism": "optimism",
+    "avalanche": "avax",
+}
 CACHE_TTL = 45  # seconds
 DAILY_INTERVAL = 86400  # 24 h in seconds
+PEAK_REFRESH_INTERVAL = 300  # 5 min — poll live FDV to capture ATH post-call
 TOP_N = 15  # cafeboard size
 
 # Regex patterns for contract addresses
@@ -111,6 +124,28 @@ def init_db() -> None:
             conn.execute("UPDATE calls SET peak_mc = initial_mc WHERE peak_mc = 0")
             conn.commit()
             logger.info("Migration: added peak_mc column to calls table")
+
+    # Ensure peak_mc is at least initial_mc for all rows
+    with _get_db() as conn:
+        conn.execute(
+            "UPDATE calls SET peak_mc = initial_mc WHERE peak_mc < initial_mc OR peak_mc IS NULL"
+        )
+        conn.commit()
+
+    # Migration: store pair metadata + call-time price for retroactive ATH
+    with _get_db() as conn:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(calls)").fetchall()}
+        migrations = [
+            ("canonical_ca", "ALTER TABLE calls ADD COLUMN canonical_ca TEXT NOT NULL DEFAULT ''"),
+            ("pair_address", "ALTER TABLE calls ADD COLUMN pair_address TEXT NOT NULL DEFAULT ''"),
+            ("chain_id", "ALTER TABLE calls ADD COLUMN chain_id TEXT NOT NULL DEFAULT ''"),
+            ("call_price_usd", "ALTER TABLE calls ADD COLUMN call_price_usd REAL NOT NULL DEFAULT 0"),
+        ]
+        for col, sql in migrations:
+            if col not in cols:
+                conn.execute(sql)
+                logger.info("Migration: added %s column to calls table", col)
+        conn.commit()
 
     logger.info("Database initialized at %s", DB_PATH)
 
@@ -184,11 +219,17 @@ def insert_call(
     thesis: str,
     call_type: str,
     initial_mc: float,
+    *,
+    canonical_ca: str = "",
+    pair_address: str = "",
+    chain_id: str = "",
+    call_price_usd: float = 0,
 ) -> None:
     with _get_db() as conn:
         conn.execute(
-            "INSERT INTO calls (chat_id, user_id, username, ca, thesis, call_type, initial_mc, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO calls (chat_id, user_id, username, ca, thesis, call_type, initial_mc, peak_mc, "
+            "timestamp, canonical_ca, pair_address, chain_id, call_price_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 chat_id,
                 user_id,
@@ -197,7 +238,12 @@ def insert_call(
                 thesis,
                 call_type,
                 initial_mc,
+                initial_mc,
                 datetime.now(timezone.utc).isoformat(),
+                canonical_ca or ca,
+                pair_address,
+                chain_id,
+                call_price_usd,
             ),
         )
         conn.commit()
@@ -223,20 +269,182 @@ def get_any_call(chat_id: int, ca: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def update_peak_mc(call_id: int, new_peak: float) -> None:
-    """Update peak_mc for a call if the new value is higher."""
+def sync_peak_mc(call_id: int, candidate_peak: float) -> float:
+    """Update and return ATH market cap for a call (never below entry MC)."""
     with _get_db() as conn:
-        conn.execute(
-            "UPDATE calls SET peak_mc = ? WHERE id = ? AND ? > peak_mc",
-            (new_peak, call_id, new_peak),
-        )
-        conn.commit()
+        row = conn.execute(
+            "SELECT peak_mc, initial_mc FROM calls WHERE id=?",
+            (call_id,),
+        ).fetchone()
+        if not row:
+            return candidate_peak
+
+        stored = float(row["peak_mc"] or 0)
+        initial = float(row["initial_mc"] or 0)
+        baseline = max(stored, initial)
+        new_peak = max(baseline, candidate_peak)
+        if new_peak > stored:
+            conn.execute(
+                "UPDATE calls SET peak_mc=? WHERE id=?",
+                (new_peak, call_id),
+            )
+            conn.commit()
+        return new_peak
+
+
+def _chains_for_ca(ca: str) -> list[str]:
+    if ca.startswith("0x"):
+        return ["ethereum", "base", "bsc", "arbitrum", "polygon", "optimism", "avalanche"]
+    return ["solana"]
+
+
+def _parse_call_timestamp(call: dict) -> int:
+    try:
+        ts = datetime.fromisoformat(str(call["timestamp"]).replace("Z", "+00:00"))
+        return int(ts.timestamp())
+    except Exception:
+        return 0
+
+
+def _estimate_call_price(initial_mc: float, current_fdv: float, current_price: float) -> float:
+    if initial_mc <= 0 or current_fdv <= 0 or current_price <= 0:
+        return 0.0
+    return current_price * (initial_mc / current_fdv)
+
+
+def _price_high_to_mcap(high_price: float, initial_mc: float, call_price: float) -> float:
+    if high_price <= 0 or call_price <= 0 or initial_mc <= 0:
+        return 0.0
+    return initial_mc * (high_price / call_price)
+
+
+def fetch_gecko_ohlcv_high(pool_address: str, chain_id: str, since_ts: int) -> Optional[float]:
+    """Return the highest candle close/high price since *since_ts* via GeckoTerminal."""
+    network = GECKO_NETWORK.get((chain_id or "").lower())
+    if not network or not pool_address:
+        return None
+
+    max_high = 0.0
+    for timeframe, aggregate in (("day", 1), ("hour", 1)):
+        url = GECKO_OHLCV.format(network=network, pool=pool_address, timeframe=timeframe)
+        try:
+            resp = requests.get(
+                url,
+                params={"aggregate": aggregate, "limit": 1000},
+                timeout=15,
+                headers={"Accept": "application/json"},
+            )
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            rows = resp.json().get("data", {}).get("attributes", {}).get("ohlcv_list") or []
+            for row in rows:
+                if len(row) < 3:
+                    continue
+                ts = int(row[0])
+                high = float(row[2])
+                if since_ts and ts < since_ts:
+                    continue
+                if high > max_high:
+                    max_high = high
+        except Exception as exc:
+            logger.debug("Gecko OHLCV %s failed for %s: %s", timeframe, pool_address, exc)
+
+    return max_high if max_high > 0 else None
+
+
+def _dex_from_call(call: dict, ca: str) -> Optional[dict]:
+    """Build a minimal DexScreener-shaped dict from stored call metadata."""
+    pair = call.get("pair_address") or ""
+    chain = call.get("chain_id") or ""
+    dex = get_dexscreener_data_for_call(call, ca)
+    if dex:
+        return dex
+    if not pair:
+        return None
+    dex_ca = call.get("canonical_ca") or ca
+    return {
+        "symbol": "???",
+        "name": call.get("thesis") or "Unknown",
+        "fdv": 0.0,
+        "liquidity_usd": 0.0,
+        "volume_24h": 0.0,
+        "pair_address": pair,
+        "chain_id": chain,
+        "dex_id": "",
+        "price_usd": float(call.get("call_price_usd") or 0),
+        "canonical_ca": dex_ca,
+        "quote_token_address": "",
+    }
+
+
+def resolve_ath_post_call(call: dict, dex: Optional[dict]) -> float:
+    """
+    Compute ATH market cap after the call using historical OHLC + live FDV polling.
+    Updates peak_mc in the database and returns the resolved value.
+    """
+    initial_mc = float(call.get("initial_mc") or 0)
+    stored_peak = float(call.get("peak_mc") or 0)
+    call_id = call["id"]
+
+    if not dex:
+        return sync_peak_mc(call_id, max(stored_peak, initial_mc))
+
+    backfill_call_metadata(call_id, dex)
+    if dex.get("pair_address"):
+        call["pair_address"] = dex["pair_address"]
+    if dex.get("chain_id"):
+        call["chain_id"] = dex["chain_id"]
+    if dex.get("canonical_ca"):
+        call["canonical_ca"] = dex["canonical_ca"]
+    if not float(call.get("call_price_usd") or 0) and dex.get("price_usd"):
+        call["call_price_usd"] = dex["price_usd"]
+
+    current_fdv = float(dex.get("fdv") or 0)
+    current_price = float(dex.get("price_usd") or 0)
+    ath = max(initial_mc, stored_peak, current_fdv)
+
+    call_price = float(call.get("call_price_usd") or 0)
+    if call_price <= 0:
+        call_price = _estimate_call_price(initial_mc, current_fdv, current_price)
+    if call_price <= 0 and current_price > 0:
+        call_price = current_price
+
+    since_ts = _parse_call_timestamp(call)
+    pool = dex.get("pair_address") or call.get("pair_address") or ""
+    chain = dex.get("chain_id") or call.get("chain_id") or ""
+
+    max_high = fetch_gecko_ohlcv_high(pool, chain, since_ts)
+    if max_high and call_price > 0:
+        hist_ath = _price_high_to_mcap(max_high, initial_mc, call_price)
+        if hist_ath > ath:
+            ath = hist_ath
+            logger.info(
+                "Historical ATH for call %s: %s (high=%.8f)",
+                call_id,
+                fmt_usd(hist_ath),
+                max_high,
+            )
+
+    resolved = sync_peak_mc(call_id, ath)
+    call["peak_mc"] = resolved
+    return resolved
 
 
 def get_chat_calls(chat_id: int) -> list[dict]:
     with _get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM calls WHERE chat_id=? ORDER BY id ASC", (chat_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_calls_brief() -> list[dict]:
+    """Return call rows needed for ATH refresh."""
+    with _get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, ca, canonical_ca, pair_address, chain_id, initial_mc, peak_mc, "
+            "call_price_usd, timestamp FROM calls"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -263,7 +471,8 @@ def get_active_chats() -> list[int]:
 def get_dexscreener_data(ca: str) -> Optional[dict]:
     """
     Fetch the highest-liquidity pair for *ca* from DexScreener.
-    Returns dict with keys: symbol, name, fdv, liquidity_usd, volume_24h, pair_address
+    Returns dict with keys: symbol, name, fdv, liquidity_usd, volume_24h, pair_address,
+    chain_id, dex_id, price_usd, canonical_ca, quote_token_address
     Uses a short in-memory cache to stay rate-limit friendly.
     """
     key = ca.lower()
@@ -272,16 +481,28 @@ def get_dexscreener_data(ca: str) -> Optional[dict]:
     if cached and now - cached[0] < CACHE_TTL:
         return cached[1]
 
-    url = DEXSCREENER_SEARCH.format(ca)
-    try:
-        resp = requests.get(url, timeout=12)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        logger.error("DexScreener request failed for %s: %s", ca, exc)
-        return None
+    pairs: list[dict] = []
+    for chain in _chains_for_ca(ca):
+        url = DEXSCREENER_TOKEN_PAIRS.format(chain=chain, ca=ca)
+        try:
+            resp = requests.get(url, timeout=12)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and data:
+                pairs.extend(data)
+        except Exception as exc:
+            logger.debug("DexScreener token-pairs failed for %s on %s: %s", ca, chain, exc)
 
-    pairs = data.get("pairs") or []
+    if not pairs:
+        url = DEXSCREENER_SEARCH.format(ca)
+        try:
+            resp = requests.get(url, timeout=12)
+            resp.raise_for_status()
+            pairs = resp.json().get("pairs") or []
+        except Exception as exc:
+            logger.error("DexScreener request failed for %s: %s", ca, exc)
+            return None
+
     if not pairs:
         return None
 
@@ -290,7 +511,6 @@ def get_dexscreener_data(ca: str) -> Optional[dict]:
     best_liq = -1.0
     for p in pairs:
         liq = float(p.get("liquidity", {}).get("usd") or 0)
-        # Match the CA to either base or quote token
         base_addr = (p.get("baseToken") or {}).get("address", "").lower()
         quote_addr = (p.get("quoteToken") or {}).get("address", "").lower()
         if key in (base_addr, quote_addr) and liq > best_liq:
@@ -301,23 +521,108 @@ def get_dexscreener_data(ca: str) -> Optional[dict]:
         # Fallback: highest liquidity pair overall
         best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd") or 0))
 
-    # Determine which token matches our CA
-    base_addr = (best.get("baseToken") or {}).get("address", "").lower()
-    if base_addr == key:
+    base_addr = (best.get("baseToken") or {}).get("address", "")
+    quote_addr = (best.get("quoteToken") or {}).get("address", "")
+    if base_addr.lower() == key:
         token = best["baseToken"]
-    else:
+        canonical_ca = base_addr
+    elif quote_addr.lower() == key:
         token = best.get("quoteToken") or best.get("baseToken") or {}
+        canonical_ca = quote_addr
+    else:
+        token = best.get("baseToken") or {}
+        canonical_ca = token.get("address", ca)
 
+    fdv = float(best.get("fdv") or best.get("marketCap") or 0)
     result = {
         "symbol": token.get("symbol", "???"),
         "name": token.get("name", "Unknown"),
-        "fdv": float(best.get("fdv") or 0),
+        "fdv": fdv,
         "liquidity_usd": float(best.get("liquidity", {}).get("usd") or 0),
         "volume_24h": float(best.get("volume", {}).get("h24") or 0),
         "pair_address": best.get("pairAddress", ""),
+        "chain_id": best.get("chainId", ""),
+        "dex_id": best.get("dexId", ""),
+        "price_usd": float(best.get("priceUsd") or 0),
+        "canonical_ca": canonical_ca,
+        "quote_token_address": (best.get("quoteToken") or {}).get("address", ""),
     }
     _dex_cache[key] = (now, result)
     return result
+
+
+def get_dexscreener_data_for_call(call: dict, ca: str) -> Optional[dict]:
+    """Resolve DexScreener data for a stored call, with symbol-based fallback."""
+    dex_ca = call.get("canonical_ca") or ca
+    dex = get_dexscreener_data(dex_ca)
+    if dex:
+        return dex
+
+    thesis = call.get("thesis") or ""
+    sym_match = re.search(r"\(\$([^)]+)\)", thesis)
+    if not sym_match:
+        return None
+
+    symbol = sym_match.group(1).strip()
+    if not symbol:
+        return None
+
+    url = DEXSCREENER_SEARCH.format(symbol)
+    try:
+        resp = requests.get(url, timeout=12)
+        resp.raise_for_status()
+        pairs = resp.json().get("pairs") or []
+    except Exception as exc:
+        logger.debug("DexScreener symbol fallback failed for %s: %s", symbol, exc)
+        return None
+
+    target = ca.lower()
+    matches = [
+        p
+        for p in pairs
+        if (p.get("baseToken") or {}).get("address", "").lower() == target
+        or (p.get("quoteToken") or {}).get("address", "").lower() == target
+    ]
+    if not matches:
+        return None
+
+    best = max(matches, key=lambda p: float(p.get("liquidity", {}).get("usd") or 0))
+    token = best.get("baseToken") or {}
+    if (token.get("address") or "").lower() != target:
+        token = best.get("quoteToken") or token
+
+    return {
+        "symbol": token.get("symbol", symbol),
+        "name": token.get("name", thesis),
+        "fdv": float(best.get("fdv") or best.get("marketCap") or 0),
+        "liquidity_usd": float(best.get("liquidity", {}).get("usd") or 0),
+        "volume_24h": float(best.get("volume", {}).get("h24") or 0),
+        "pair_address": best.get("pairAddress", ""),
+        "chain_id": best.get("chainId", ""),
+        "dex_id": best.get("dexId", ""),
+        "price_usd": float(best.get("priceUsd") or 0),
+        "canonical_ca": token.get("address", ca),
+        "quote_token_address": (best.get("quoteToken") or {}).get("address", ""),
+    }
+
+
+def backfill_call_metadata(call_id: int, dex: dict) -> None:
+    """Persist pair metadata on older rows that predate the migration."""
+    if not dex.get("pair_address"):
+        return
+    with _get_db() as conn:
+        conn.execute(
+            "UPDATE calls SET canonical_ca=?, pair_address=?, chain_id=?, call_price_usd=? "
+            "WHERE id=? AND (pair_address='' OR canonical_ca='' OR call_price_usd=0)",
+            (
+                dex.get("canonical_ca", ""),
+                dex.get("pair_address", ""),
+                dex.get("chain_id", ""),
+                float(dex.get("price_usd") or 0),
+                call_id,
+            ),
+        )
+        conn.commit()
 
 
 # =========================================================================
@@ -674,12 +979,11 @@ def calculate_cafeboard(chat_id: int) -> list[dict]:
         best_ticker = ""
         best_call_type = ucalls[0].get("call_type", "alpha")
         for c in ucalls:
-            dex = get_dexscreener_data(c["ca"])
+            dex = get_dexscreener_data_for_call(c, c["ca"])
+            if not dex:
+                dex = _dex_from_call(c, c["ca"])
             if dex and c["initial_mc"] > 0:
-                # Update peak_mc while we have fresh data
-                update_peak_mc(c["id"], dex["fdv"])
-                # Use ATH (peak_mc) for X, not current FDV
-                peak = max(c.get("peak_mc", 0) or 0, dex["fdv"])
+                peak = resolve_ath_post_call(c, dex)
                 cur_x = peak / c["initial_mc"]
                 if cur_x > best_x:
                     best_x = cur_x
@@ -780,8 +1084,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if update.effective_chat and update.effective_chat.type == "private":
         await update.message.reply_text(
             "☕ Welcome to TheBrewBot!\n\n"
-            "Add me to a group chat to start tracking crypto calls.\n"
-            "Share a contract address with a thesis (20+ chars) and I'll brew it for you!\n\n"
+            "Add me to a group chat and paste a contract address to submit a call.\n\n"
             "Type /help for full instructions ☕"
         )
 
@@ -790,8 +1093,7 @@ HELP_TEXT = (
     "☕ <b>BrewBot — How It Works</b> ☕\n"
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     "<b>1️⃣ Share a Call</b>\n"
-    "Drop a contract address in the group along with your thesis "
-    "(minimum 20 characters, at least 3 real words — no spam).\n\n"
+    "Paste a contract address in the group — that's it.\n\n"
     "<b>2️⃣ Pick Your Brew</b>\n"
     "BrewBot detects the CA, pulls live data from DexScreener, "
     "and gives you two buttons:\n"
@@ -850,11 +1152,11 @@ async def _send_welcome(chat_id: int, chat_title: str, context: ContextTypes.DEF
     welcome_text = (
         "☕ <b>BrewBot has entered the café!</b> ☕\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "I'm your crypto call tracker. Share a contract address "
-        "with your thesis and I'll lock in the market cap. "
+        "I'm your crypto call tracker. Paste a contract address "
+        "and I'll lock in the market cap. "
         "Come back later to check your PnL with a Coffee Card.\n\n"
         "<b>How to use me:</b>\n\n"
-        "<b>1.</b> Paste a contract address + your thesis (min 20 chars, real words)\n"
+        "<b>1.</b> Paste a contract address\n"
         "<b>2.</b> Tap <b>Alpha 🏆</b> or <b>Gamble 🎲</b> to lock in your call\n"
         "<b>3.</b> Run <code>/pnl &lt;CA&gt;</code> to see your gains on a Coffee Card\n"
         "<b>4.</b> Run <code>/cafeboard</code> to see who's the top caller\n\n"
@@ -931,13 +1233,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not ca:
         return
 
-    # Extract thesis (original text minus the CA)
-    thesis = text.replace(ca, "").strip()
-    if len(thesis) < 20 or not is_valid_thesis(thesis):
+    existing = get_any_call(chat.id, ca)
+    if existing:
         await update.message.reply_text(
-            "☕ To submit a call, you need to provide a real thesis alongside "
-            "the contract address — minimum 20 characters, at least 3 real words. "
-            "No spam or gibberish! Give us your actual reasoning ☕"
+            f"☕ @{existing['username']} already called this token at "
+            f"{fmt_usd(existing['initial_mc'])}"
         )
         return
 
@@ -955,6 +1255,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "☕ Token found but market cap data isn't available yet. Try again later!"
         )
         return
+
+    upsert_active_chat(chat.id)
 
     # Build reply
     info_text = (
@@ -981,7 +1283,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Store pending call data keyed by the bot's reply message ID
     _pending_calls[sent.message_id] = {
         "ca": ca,
-        "thesis": text,  # full original message text
+        "thesis": f"{dex['name']} (${dex['symbol']})",
         "initial_mc": dex["fdv"],
         "user_id": update.message.from_user.id,
         "username": update.message.from_user.username or update.message.from_user.first_name or "Anon",
@@ -1016,11 +1318,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer("☕ Only the original caller can brew this one!", show_alert=True)
         return
 
-    # Check for duplicate
-    existing = get_user_call(pending["chat_id"], pending["user_id"], ca)
+    # Check for duplicate — one call per token per group
+    existing = get_any_call(pending["chat_id"], ca)
     if existing:
-        await query.answer("☕ You've already brewed a call for this token!", show_alert=True)
+        await query.answer(
+            f"@{existing['username']} already called this at {fmt_usd(existing['initial_mc'])}",
+            show_alert=True,
+        )
         return
+
+    dex = pending["dex"]
 
     # Insert into DB
     insert_call(
@@ -1031,13 +1338,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thesis=pending["thesis"],
         call_type=call_type,
         initial_mc=pending["initial_mc"],
+        canonical_ca=dex.get("canonical_ca", ca),
+        pair_address=dex.get("pair_address", ""),
+        chain_id=dex.get("chain_id", ""),
+        call_price_usd=dex.get("price_usd", 0),
     )
+    upsert_active_chat(pending["chat_id"])
 
     # Clean up pending
     del _pending_calls[msg_id]
 
     type_label = "Gamble 🎲" if call_type == "gamble" else "Alpha 🏆"
-    dex = pending["dex"]
     confirm_text = (
         f"☕ <b>{dex['name']}</b> (${dex['symbol']})\n\n"
         f"💰 Market Cap (FDV): <b>{fmt_usd(dex['fdv'])}</b>\n"
@@ -1087,30 +1398,26 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.info("/pnl — no call found for lookup_chat=%s ca=%s", lookup_chat_id, ca)
         await update.message.reply_text(
             "☕ No brewed call found for that token in this chat. "
-            "Share a CA with your thesis first!"
+            "Paste the CA first to submit a call!"
         )
         return
 
     # Fetch current data
-    dex = get_dexscreener_data(ca)
+    dex = get_dexscreener_data_for_call(call, ca)
     if not dex:
+        dex = _dex_from_call(call, ca)
+    if not dex or (dex.get("fdv", 0) <= 0 and not call.get("pair_address")):
         await update.message.reply_text(
             "☕ Couldn't fetch current data from DexScreener. Try again shortly!"
         )
         return
 
-    current_mc = dex["fdv"]
     initial_mc = call["initial_mc"]
     if initial_mc <= 0:
         await update.message.reply_text("☕ Initial market cap was zero — can't calculate PnL!")
         return
 
-    # Update peak_mc if current FDV is a new high
-    update_peak_mc(call["id"], current_mc)
-    # Re-read peak_mc from DB to get the true ATH (not the stale row we loaded earlier)
-    call_refreshed = get_any_call(lookup_chat_id, ca)
-    peak_mc = max(call_refreshed.get("peak_mc", 0) or 0 if call_refreshed else 0, current_mc)
-
+    peak_mc = resolve_ath_post_call(call, dex)
     x_mult = peak_mc / initial_mc
     pct_gain = (x_mult - 1) * 100
 
@@ -1208,6 +1515,16 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # =========================================================================
 # Daily auto-post job
 # =========================================================================
+async def peak_mc_refresh_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Refresh ATH post-call for all stored calls using OHLC history + live FDV."""
+    for call in get_all_calls_brief():
+        dex = get_dexscreener_data_for_call(call, call["ca"])
+        if not dex:
+            dex = _dex_from_call(call, call["ca"])
+        if dex:
+            resolve_ath_post_call(call, dex)
+
+
 async def daily_cafeboard_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-post the cafeboard to all active groups every 24 hours."""
     logger.info("Running daily cafeboard auto-post…")
@@ -1277,7 +1594,14 @@ def main() -> None:
             first=DAILY_INTERVAL,
             name="daily_cafeboard",
         )
+        job_queue.run_repeating(
+            peak_mc_refresh_job,
+            interval=PEAK_REFRESH_INTERVAL,
+            first=60,
+            name="peak_mc_refresh",
+        )
         logger.info("Daily cafeboard job scheduled (every %ds)", DAILY_INTERVAL)
+        logger.info("Peak MC refresh job scheduled (every %ds)", PEAK_REFRESH_INTERVAL)
     else:
         logger.warning("JobQueue not available — daily auto-post disabled")
 
