@@ -1270,38 +1270,38 @@ def generate_caption(username: str, x_mult: float, pct_gain: float) -> str:
     """Build a warm coffee-themed caption for the Coffee Card photo."""
     if x_mult >= 10:
         compliment = (
-            f"☕ Brewed to perfection at {x_mult:.1f}x — "
-            f"@{username} is the real alpha barista of the café 🔥"
+            f"Brewed to perfection at {x_mult:.1f}x — "
+            f"@{username} is the real alpha barista of the café! ☕"
         )
     elif x_mult >= 5:
         compliment = (
-            f"☕ Extra-strong brew at {x_mult:.1f}x — "
-            f"the café smells like alpha thanks to @{username} 🔥"
+            f"Extra-strong brew at {x_mult:.1f}x — "
+            f"the café smells like alpha thanks to @{username}! ☕"
         )
     elif x_mult >= 4:
         compliment = (
-            f"☕ That's the roast of the day at {x_mult:.1f}x — "
-            f"@{username} is running a hot café 🔥"
+            f"That's the roast of the day at {x_mult:.1f}x — "
+            f"@{username} is running a hot café! ☕"
         )
     elif x_mult >= 3:
         compliment = (
-            f"☕ The café is buzzing at {x_mult:.1f}x — "
-            f"@{username} knows how to pull a clean cup"
+            f"The café is buzzing at {x_mult:.1f}x — "
+            f"@{username} knows how to pull a clean cup! ☕"
         )
     elif x_mult >= 2:
         compliment = (
-            f"☕ The grind is paying off at {x_mult:.1f}x — "
-            f"@{username} is heating things up nicely"
+            f"The grind is paying off at {x_mult:.1f}x — "
+            f"@{username} is heating things up nicely! ☕"
         )
     elif x_mult >= 1:
         compliment = (
-            f"☕ The brew is warming up at {x_mult:.1f}x — "
-            f"keep that grinder going @{username}"
+            f"The brew is warming up at {x_mult:.1f}x — "
+            f"keep that grinder going @{username}! ☕"
         )
     else:
         compliment = (
-            f"☕ Even the best baristas have off-days at {x_mult:.1f}x — "
-            f"the next cup will be stronger @{username} 💪"
+            f"Even the best baristas have off-days at {x_mult:.1f}x — "
+            f"the next cup will be stronger @{username}! ☕"
         )
 
     promo = (
