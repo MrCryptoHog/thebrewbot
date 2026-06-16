@@ -1276,22 +1276,22 @@ def generate_caption(username: str, x_mult: float, pct_gain: float) -> str:
     elif x_mult >= 5:
         compliment = (
             f"☕ Extra-strong brew at {x_mult:.1f}x — "
-            f"pure alpha thanks to @{username} 🔥"
+            f"the café smells like alpha thanks to @{username} 🔥"
         )
-    elif x_mult >= 3.5:
+    elif x_mult >= 4:
         compliment = (
-            f"☕ A solid quad shot at {x_mult:.1f}x — "
-            f"your portfolio is on fire @{username} 🔥"
+            f"☕ That's the roast of the day at {x_mult:.1f}x — "
+            f"@{username} is running a hot café 🔥"
         )
-    elif x_mult >= 2.5:
+    elif x_mult >= 3:
         compliment = (
-            f"☕ A solid triple shot at {x_mult:.1f}x — "
-            f"your portfolio is steaming nicely @{username}"
+            f"☕ The café is buzzing at {x_mult:.1f}x — "
+            f"@{username} knows how to pull a clean cup"
         )
-    elif x_mult >= 1.75:
+    elif x_mult >= 2:
         compliment = (
-            f"☕ A solid double shot at {x_mult:.1f}x — "
-            f"your portfolio is warming up @{username}"
+            f"☕ The grind is paying off at {x_mult:.1f}x — "
+            f"@{username} is heating things up nicely"
         )
     elif x_mult >= 1:
         compliment = (
