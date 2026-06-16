@@ -312,6 +312,27 @@ def _estimate_call_price(initial_mc: float, current_fdv: float, current_price: f
     return current_price * (initial_mc / current_fdv)
 
 
+def _resolve_call_price(
+    stored_price: float,
+    initial_mc: float,
+    current_fdv: float,
+    current_price: float,
+) -> float:
+    """Pick the USD price at call time for ATH math (not today's price)."""
+    estimated = _estimate_call_price(initial_mc, current_fdv, current_price)
+    if estimated <= 0:
+        return stored_price if stored_price > 0 else 0.0
+    if stored_price <= 0:
+        return estimated
+    # Older rows were backfilled with live price — that breaks historical ATH math.
+    if current_price > 0 and abs(stored_price - current_price) / current_price < 0.15:
+        return estimated
+    implied_entry_mcap = current_fdv * (stored_price / current_price) if current_price > 0 else 0
+    if current_fdv > 0 and implied_entry_mcap > initial_mc * 1.5:
+        return estimated
+    return stored_price
+
+
 def _price_high_to_mcap(high_price: float, initial_mc: float, call_price: float) -> float:
     if high_price <= 0 or call_price <= 0 or initial_mc <= 0:
         return 0.0
@@ -384,7 +405,6 @@ def resolve_ath_post_call(call: dict, dex: Optional[dict]) -> float:
     Updates peak_mc in the database and returns the resolved value.
     """
     initial_mc = float(call.get("initial_mc") or 0)
-    stored_peak = float(call.get("peak_mc") or 0)
     call_id = call["id"]
 
     if not dex:
@@ -397,33 +417,44 @@ def resolve_ath_post_call(call: dict, dex: Optional[dict]) -> float:
         call["chain_id"] = dex["chain_id"]
     if dex.get("canonical_ca"):
         call["canonical_ca"] = dex["canonical_ca"]
-    if not float(call.get("call_price_usd") or 0) and dex.get("price_usd"):
-        call["call_price_usd"] = dex["price_usd"]
 
     current_fdv = float(dex.get("fdv") or 0)
     current_price = float(dex.get("price_usd") or 0)
-    ath = max(initial_mc, stored_peak, current_fdv)
-
-    call_price = float(call.get("call_price_usd") or 0)
-    if call_price <= 0:
-        call_price = _estimate_call_price(initial_mc, current_fdv, current_price)
-    if call_price <= 0 and current_price > 0:
-        call_price = current_price
+    call_price = _resolve_call_price(
+        float(call.get("call_price_usd") or 0),
+        initial_mc,
+        current_fdv,
+        current_price,
+    )
+    ath = max(initial_mc, current_fdv)
 
     since_ts = _parse_call_timestamp(call)
     pool = dex.get("pair_address") or call.get("pair_address") or ""
-    chain = dex.get("chain_id") or call.get("chain_id") or ""
+    chain = (dex.get("chain_id") or call.get("chain_id") or "").lower()
+    if not chain and pool and not str(call.get("ca", "")).startswith("0x"):
+        chain = "solana"
 
-    max_high = fetch_gecko_ohlcv_high(pool, chain, since_ts)
-    if max_high and call_price > 0:
-        hist_ath = _price_high_to_mcap(max_high, initial_mc, call_price)
-        if hist_ath > ath:
-            ath = hist_ath
-            logger.info(
-                "Historical ATH for call %s: %s (high=%.8f)",
+    if not pool:
+        logger.warning("ATH resolve: no pool for call %s ca=%s", call_id, call.get("ca"))
+    else:
+        max_high = fetch_gecko_ohlcv_high(pool, chain, since_ts)
+        if max_high and call_price > 0:
+            hist_ath = _price_high_to_mcap(max_high, initial_mc, call_price)
+            if hist_ath > ath:
+                ath = hist_ath
+                logger.info(
+                    "Historical ATH for call %s: %s (high=%.8f call_price=%.10f)",
+                    call_id,
+                    fmt_usd(hist_ath),
+                    max_high,
+                    call_price,
+                )
+        elif not max_high:
+            logger.warning(
+                "ATH resolve: no Gecko OHLC for call %s pool=%s chain=%s",
                 call_id,
-                fmt_usd(hist_ath),
-                max_high,
+                pool,
+                chain,
             )
 
     resolved = sync_peak_mc(call_id, ath)
@@ -560,10 +591,11 @@ def get_dexscreener_data_for_call(call: dict, ca: str) -> Optional[dict]:
 
     thesis = call.get("thesis") or ""
     sym_match = re.search(r"\(\$([^)]+)\)", thesis)
-    if not sym_match:
-        return None
-
-    symbol = sym_match.group(1).strip()
+    if sym_match:
+        symbol = sym_match.group(1).strip()
+    else:
+        # Plain thesis like "THREE" or "three"
+        symbol = thesis.strip().split()[0].lstrip("$") if thesis.strip() else ""
     if not symbol:
         return None
 
@@ -612,13 +644,12 @@ def backfill_call_metadata(call_id: int, dex: dict) -> None:
         return
     with _get_db() as conn:
         conn.execute(
-            "UPDATE calls SET canonical_ca=?, pair_address=?, chain_id=?, call_price_usd=? "
-            "WHERE id=? AND (pair_address='' OR canonical_ca='' OR call_price_usd=0)",
+            "UPDATE calls SET canonical_ca=?, pair_address=?, chain_id=? "
+            "WHERE id=? AND (pair_address='' OR canonical_ca='')",
             (
                 dex.get("canonical_ca", ""),
                 dex.get("pair_address", ""),
                 dex.get("chain_id", ""),
-                float(dex.get("price_usd") or 0),
                 call_id,
             ),
         )
