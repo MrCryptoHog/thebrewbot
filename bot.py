@@ -306,47 +306,27 @@ def _parse_call_timestamp(call: dict) -> int:
         return 0
 
 
-def _estimate_call_price(initial_mc: float, current_fdv: float, current_price: float) -> float:
-    if initial_mc <= 0 or current_fdv <= 0 or current_price <= 0:
+def _price_high_to_mcap(high_price: float, reference_mcap: float, reference_price: float) -> float:`r`n    """Convert an OHLC high to market cap using a live mcap/price reference."""
+    if high_price <= 0 or reference_price <= 0 or reference_mcap <= 0:
         return 0.0
-    return current_price * (initial_mc / current_fdv)
+    return reference_mcap * (high_price / reference_price)
 
 
-def _resolve_call_price(
-    stored_price: float,
-    initial_mc: float,
-    current_fdv: float,
-    current_price: float,
+def fetch_gecko_ohlcv_ath_mcap(
+    pool_address: str,
+    chain_id: str,
+    since_ts: int,
+    reference_mcap: float,
+    reference_price: float,
 ) -> float:
-    """Pick the USD price at call time for ATH math (not today's price)."""
-    estimated = _estimate_call_price(initial_mc, current_fdv, current_price)
-    if estimated <= 0:
-        return stored_price if stored_price > 0 else 0.0
-    if stored_price <= 0:
-        return estimated
-    # Older rows were backfilled with live price — that breaks historical ATH math.
-    if current_price > 0 and abs(stored_price - current_price) / current_price < 0.15:
-        return estimated
-    implied_entry_mcap = current_fdv * (stored_price / current_price) if current_price > 0 else 0
-    if current_fdv > 0 and implied_entry_mcap > initial_mc * 1.5:
-        return estimated
-    return stored_price
-
-
-def _price_high_to_mcap(high_price: float, initial_mc: float, call_price: float) -> float:
-    if high_price <= 0 or call_price <= 0 or initial_mc <= 0:
-        return 0.0
-    return initial_mc * (high_price / call_price)
-
-
-def fetch_gecko_ohlcv_high(pool_address: str, chain_id: str, since_ts: int) -> Optional[float]:
-    """Return the highest candle close/high price since *since_ts* via GeckoTerminal."""
+    """Return peak market cap since *since_ts* from GeckoTerminal OHLC highs."""
     network = GECKO_NETWORK.get((chain_id or "").lower())
     if not network or not pool_address:
-        return None
+        return 0.0
 
-    max_high = 0.0
-    for timeframe, aggregate in (("day", 1), ("hour", 1)):
+    peak_mcap = 0.0
+    # Hour/day retain full history; minute only covers recent hours on GeckoTerminal.
+    for timeframe, aggregate in (("hour", 1), ("day", 1)):
         url = GECKO_OHLCV.format(network=network, pool=pool_address, timeframe=timeframe)
         try:
             resp = requests.get(
@@ -366,12 +346,73 @@ def fetch_gecko_ohlcv_high(pool_address: str, chain_id: str, since_ts: int) -> O
                 high = float(row[2])
                 if since_ts and ts < since_ts:
                     continue
-                if high > max_high:
-                    max_high = high
+                mcap = _price_high_to_mcap(high, reference_mcap, reference_price)
+                if mcap > peak_mcap:
+                    peak_mcap = mcap
         except Exception as exc:
             logger.debug("Gecko OHLCV %s failed for %s: %s", timeframe, pool_address, exc)
 
-    return max_high if max_high > 0 else None
+    return peak_mcap
+
+
+def _pair_ath_mcap(pair: dict, since_ts: int) -> float:
+    """Peak post-call market cap for one DexScreener pair."""
+    ref_mcap = float(pair.get("market_cap") or pair.get("fdv") or 0)
+    ref_price = float(pair.get("price_usd") or 0)
+    pool = pair.get("pair_address") or ""
+    chain = (pair.get("chain_id") or "").lower()
+    if not chain and pool:
+        chain = "solana"
+    if ref_mcap <= 0 or ref_price <= 0 or not pool:
+        return 0.0
+    return fetch_gecko_ohlcv_ath_mcap(pool, chain, since_ts, ref_mcap, ref_price)
+
+
+def fetch_token_ath_mcap(primary: dict, ca: str, since_ts: int) -> float:
+    """Scan every live pair for *ca* and return the highest post-call ATH market cap."""
+    key = ca.lower()
+    pairs: list[dict] = []
+    for chain in _chains_for_ca(ca):
+        url = DEXSCREENER_TOKEN_PAIRS.format(chain=chain, ca=ca)
+        try:
+            resp = requests.get(url, timeout=12)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list):
+                pairs.extend(data)
+        except Exception as exc:
+            logger.debug("token-pairs scan failed for %s on %s: %s", ca, chain, exc)
+
+    seen_pools: set[str] = set()
+    candidates: list[dict] = []
+    for raw in pairs:
+        base = (raw.get("baseToken") or {}).get("address", "").lower()
+        quote = (raw.get("quoteToken") or {}).get("address", "").lower()
+        if key not in (base, quote):
+            continue
+        pool = raw.get("pairAddress") or ""
+        if not pool or pool in seen_pools:
+            continue
+        seen_pools.add(pool)
+        candidates.append(
+            {
+                "pair_address": pool,
+                "chain_id": raw.get("chainId", ""),
+                "market_cap": float(raw.get("marketCap") or raw.get("fdv") or 0),
+                "fdv": float(raw.get("fdv") or raw.get("marketCap") or 0),
+                "price_usd": float(raw.get("priceUsd") or 0),
+            }
+        )
+
+    if primary.get("pair_address") and primary["pair_address"] not in seen_pools:
+        candidates.append(primary)
+
+    peak = 0.0
+    for pair in candidates:
+        peak = max(peak, _pair_ath_mcap(pair, since_ts))
+    if peak <= 0 and primary.get("pair_address"):
+        peak = _pair_ath_mcap(primary, since_ts)
+    return peak
 
 
 def _dex_from_call(call: dict, ca: str) -> Optional[dict]:
@@ -408,7 +449,7 @@ def resolve_ath_post_call(call: dict, dex: Optional[dict]) -> float:
     call_id = call["id"]
 
     if not dex:
-        return sync_peak_mc(call_id, max(stored_peak, initial_mc))
+        return sync_peak_mc(call_id, initial_mc)
 
     backfill_call_metadata(call_id, dex)
     if dex.get("pair_address"):
@@ -419,42 +460,29 @@ def resolve_ath_post_call(call: dict, dex: Optional[dict]) -> float:
         call["canonical_ca"] = dex["canonical_ca"]
 
     current_fdv = float(dex.get("fdv") or 0)
-    current_price = float(dex.get("price_usd") or 0)
-    call_price = _resolve_call_price(
-        float(call.get("call_price_usd") or 0),
-        initial_mc,
-        current_fdv,
-        current_price,
-    )
     ath = max(initial_mc, current_fdv)
 
     since_ts = _parse_call_timestamp(call)
-    pool = dex.get("pair_address") or call.get("pair_address") or ""
-    chain = (dex.get("chain_id") or call.get("chain_id") or "").lower()
-    if not chain and pool and not str(call.get("ca", "")).startswith("0x"):
-        chain = "solana"
+    lookup_ca = dex.get("canonical_ca") or call.get("ca") or ""
 
-    if not pool:
+    if not dex.get("pair_address"):
         logger.warning("ATH resolve: no pool for call %s ca=%s", call_id, call.get("ca"))
     else:
-        max_high = fetch_gecko_ohlcv_high(pool, chain, since_ts)
-        if max_high and call_price > 0:
-            hist_ath = _price_high_to_mcap(max_high, initial_mc, call_price)
-            if hist_ath > ath:
-                ath = hist_ath
-                logger.info(
-                    "Historical ATH for call %s: %s (high=%.8f call_price=%.10f)",
-                    call_id,
-                    fmt_usd(hist_ath),
-                    max_high,
-                    call_price,
-                )
-        elif not max_high:
+        hist_ath = fetch_token_ath_mcap(dex, lookup_ca, since_ts)
+        if hist_ath > ath:
+            ath = hist_ath
+            logger.info(
+                "Historical ATH for call %s: %s (since=%s)",
+                call_id,
+                fmt_usd(hist_ath),
+                since_ts,
+            )
+        elif hist_ath <= 0:
             logger.warning(
                 "ATH resolve: no Gecko OHLC for call %s pool=%s chain=%s",
                 call_id,
-                pool,
-                chain,
+                dex.get("pair_address"),
+                dex.get("chain_id"),
             )
 
     resolved = sync_peak_mc(call_id, ath)
@@ -565,10 +593,12 @@ def get_dexscreener_data(ca: str) -> Optional[dict]:
         canonical_ca = token.get("address", ca)
 
     fdv = float(best.get("fdv") or best.get("marketCap") or 0)
+    mcap = float(best.get("marketCap") or best.get("fdv") or 0)
     result = {
         "symbol": token.get("symbol", "???"),
         "name": token.get("name", "Unknown"),
         "fdv": fdv,
+        "market_cap": mcap,
         "liquidity_usd": float(best.get("liquidity", {}).get("usd") or 0),
         "volume_24h": float(best.get("volume", {}).get("h24") or 0),
         "pair_address": best.get("pairAddress", ""),
@@ -627,6 +657,7 @@ def get_dexscreener_data_for_call(call: dict, ca: str) -> Optional[dict]:
         "symbol": token.get("symbol", symbol),
         "name": token.get("name", thesis),
         "fdv": float(best.get("fdv") or best.get("marketCap") or 0),
+        "market_cap": float(best.get("marketCap") or best.get("fdv") or 0),
         "liquidity_usd": float(best.get("liquidity", {}).get("usd") or 0),
         "volume_24h": float(best.get("volume", {}).get("h24") or 0),
         "pair_address": best.get("pairAddress", ""),
