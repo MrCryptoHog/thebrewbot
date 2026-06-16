@@ -36,8 +36,41 @@ from telegram.ext import (
 # ---------------------------------------------------------------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-# Use persistent volume if available (/data on Railway), else fall back to local
-_data_dir = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+MAIN_GROUP = -1003575636670
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("BrewBot")
+
+
+def _init_data_dir() -> str:
+    """Pick a writable directory for SQLite (prefer Railway volume at /data)."""
+    preferred = os.getenv("DATA_DIR", "/data")
+    local = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (preferred, local):
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            probe = os.path.join(candidate, ".brewbot_write_test")
+            with open(probe, "w", encoding="utf-8") as fh:
+                fh.write("ok")
+            os.remove(probe)
+            if candidate == preferred:
+                logger.info("Using persistent data directory: %s", candidate)
+            else:
+                logger.warning(
+                    "Persistent volume %s unavailable — using %s (DB resets on redeploy)",
+                    preferred,
+                    candidate,
+                )
+            return candidate
+        except OSError as exc:
+            logger.debug("Data dir %s not usable: %s", candidate, exc)
+    return local
+
+
+_data_dir = _init_data_dir()
 DB_PATH = os.path.join(_data_dir, "cafebot.db")
 DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search?q={}"
 DEXSCREENER_TOKEN_PAIRS = "https://api.dexscreener.com/token-pairs/v1/{chain}/{ca}"
@@ -60,12 +93,6 @@ TOP_N = 15  # cafeboard size
 # Regex patterns for contract addresses
 ETH_CA_RE = re.compile(r"0x[a-fA-F0-9]{40}")
 SOL_CA_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
-
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("BrewBot")
 
 # ---------------------------------------------------------------------------
 # In-memory DexScreener cache  {ca_lower: (timestamp, data_dict)}
@@ -151,8 +178,8 @@ def init_db() -> None:
 
 
 def seed_restored_calls() -> None:
-    """One-time restore of calls lost during the accidental deployment incident."""
-    CHAT_ID = -1003575636670
+    """One-time restore of calls lost during deployment / DB reset incidents."""
+    CHAT_ID = MAIN_GROUP
     restored = [
         {
             "username": "MrOK_777",
@@ -160,7 +187,7 @@ def seed_restored_calls() -> None:
             "thesis": "Alvara ($ALVA)",
             "call_type": "alpha",
             "initial_mc": 1_690_000.0,
-            "timestamp": "2026-04-07T15:06:00+00:00",  # 16:06 UK (BST = UTC+1)
+            "timestamp": "2026-04-07T15:06:00+00:00",
         },
         {
             "username": "DonPJalapeno",
@@ -168,24 +195,47 @@ def seed_restored_calls() -> None:
             "thesis": "Momo ($MOMO)",
             "call_type": "alpha",
             "initial_mc": 51_970.0,
-            "timestamp": "2026-04-07T13:58:00+00:00",  # 14:58 UK (BST = UTC+1)
+            "timestamp": "2026-04-07T13:58:00+00:00",
+        },
+        {
+            "username": "MrOK_777",
+            "ca": "FeMbDoX7R1Psc4GEcvJdsbNbZA3bfztcyDCatJVJpump",
+            "canonical_ca": "FeMbDoX7R1Psc4GEcvJdsbNbZA3bfztcyDCatJVJpump",
+            "thesis": "three ($THREE)",
+            "call_type": "gamble",
+            "initial_mc": 114_230.0,
+            "timestamp": "2026-05-04T00:00:00+00:00",
+            "pair_address": "5ByL7MZoLABYnwMPZKPKjf4MGkZ7FeBzrAnos19Pre2z",
+            "chain_id": "solana",
         },
     ]
     with _get_db() as conn:
         for r in restored:
             existing = conn.execute(
-                "SELECT 1 FROM calls WHERE chat_id=? AND LOWER(ca)=LOWER(?) LIMIT 1",
-                (CHAT_ID, r["ca"]),
+                "SELECT 1 FROM calls WHERE chat_id=? AND (LOWER(ca)=LOWER(?) OR LOWER(canonical_ca)=LOWER(?)) LIMIT 1",
+                (CHAT_ID, r["ca"], r.get("canonical_ca") or r["ca"]),
             ).fetchone()
             if existing:
                 continue
-            # Use negative hash of username as temp user_id until real user interacts
             temp_uid = -(abs(hash(r["username"])) % (10**9))
             conn.execute(
-                "INSERT INTO calls (chat_id, user_id, username, ca, thesis, call_type, initial_mc, timestamp) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (CHAT_ID, temp_uid, r["username"], r["ca"], r["thesis"],
-                 r["call_type"], r["initial_mc"], r["timestamp"]),
+                "INSERT INTO calls (chat_id, user_id, username, ca, thesis, call_type, initial_mc, "
+                "peak_mc, timestamp, canonical_ca, pair_address, chain_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    CHAT_ID,
+                    temp_uid,
+                    r["username"],
+                    r["ca"],
+                    r["thesis"],
+                    r["call_type"],
+                    r["initial_mc"],
+                    r["initial_mc"],
+                    r["timestamp"],
+                    r.get("canonical_ca") or r["ca"],
+                    r.get("pair_address", ""),
+                    r.get("chain_id", ""),
+                ),
             )
             logger.info("Restored call: @%s — %s", r["username"], r["ca"])
         conn.commit()
@@ -261,12 +311,93 @@ def get_user_call(chat_id: int, user_id: int, ca: str) -> Optional[dict]:
 
 def get_any_call(chat_id: int, ca: str) -> Optional[dict]:
     """Fetch the first call for this CA in a chat, regardless of who made it."""
+    key = ca.lower()
     with _get_db() as conn:
         row = conn.execute(
-            "SELECT * FROM calls WHERE chat_id=? AND LOWER(ca)=LOWER(?) ORDER BY id ASC LIMIT 1",
-            (chat_id, ca),
+            "SELECT * FROM calls WHERE chat_id=? AND (LOWER(ca)=? OR LOWER(canonical_ca)=?) "
+            "ORDER BY id ASC LIMIT 1",
+            (chat_id, key, key),
         ).fetchone()
     return dict(row) if row else None
+
+
+def get_call_by_ca_any_chat(ca: str) -> Optional[dict]:
+    """Find a call for this CA in any chat (fallback when group DB was reset)."""
+    key = ca.lower()
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM calls WHERE LOWER(ca)=? OR LOWER(canonical_ca)=? "
+            "ORDER BY id ASC LIMIT 1",
+            (key, key),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _mint_chars_differ(a: str, b: str) -> int:
+    if len(a) != len(b):
+        return max(len(a), len(b))
+    return sum(1 for x, y in zip(a, b) if x.lower() != y.lower())
+
+
+def _mints_match(stored: str, query: str) -> bool:
+    """True when two mint strings refer to the same token (typos / casing)."""
+    if not stored or not query:
+        return False
+    if stored.lower() == query.lower():
+        return True
+    # Solana mints are fixed length; small paste typos still hit the same token.
+    if len(stored) == len(query) and _mint_chars_differ(stored, query) <= 4:
+        return True
+    return False
+
+
+def _fuzzy_find_call(chat_id: int, ca: str, *, any_chat: bool = False) -> Optional[dict]:
+    with _get_db() as conn:
+        if any_chat:
+            rows = conn.execute("SELECT * FROM calls ORDER BY id ASC").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM calls WHERE chat_id=? ORDER BY id ASC",
+                (chat_id,),
+            ).fetchall()
+    for row in rows:
+        rec = dict(row)
+        for field in ("ca", "canonical_ca"):
+            if _mints_match(str(rec.get(field) or ""), ca):
+                return rec
+    return None
+
+
+def _resolve_dex_mint(ca: str) -> Optional[str]:
+    """Return DexScreener's canonical mint for a pasted address (handles typos)."""
+    pairs = _fetch_dexscreener_pairs(ca)
+    for pair in pairs:
+        for tok in (pair.get("baseToken"), pair.get("quoteToken")):
+            addr = (tok or {}).get("address", "")
+            if addr and _mints_match(addr, ca):
+                return addr
+    return None
+
+
+def lookup_call_for_pnl(chat_id: int, ca: str) -> Optional[dict]:
+    """Resolve a stored call for /pnl — exact match, DexScreener mint, then fuzzy."""
+    candidates: list[str] = [ca]
+    resolved = _resolve_dex_mint(ca)
+    if resolved and resolved not in candidates:
+        candidates.append(resolved)
+
+    for candidate in candidates:
+        hit = get_any_call(chat_id, candidate) or get_call_by_ca_any_chat(candidate)
+        if hit:
+            return hit
+
+    return _fuzzy_find_call(chat_id, ca) or _fuzzy_find_call(chat_id, ca, any_chat=True)
+
+
+def count_calls() -> int:
+    with _get_db() as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM calls").fetchone()
+    return int(row["n"]) if row else 0
 
 
 def sync_peak_mc(call_id: int, candidate_peak: float) -> float:
@@ -528,6 +659,52 @@ def get_active_chats() -> list[int]:
 # =========================================================================
 # DexScreener helpers
 # =========================================================================
+def _fetch_dexscreener_pairs(ca: str) -> list[dict]:
+    """Load DexScreener pairs for *ca*, with Solana case-insensitive fallbacks."""
+    key = ca.lower()
+    pairs: list[dict] = []
+
+    for chain in _chains_for_ca(ca):
+        url = DEXSCREENER_TOKEN_PAIRS.format(chain=chain, ca=ca)
+        try:
+            resp = requests.get(url, timeout=12)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and data:
+                pairs.extend(data)
+        except Exception as exc:
+            logger.debug("DexScreener token-pairs failed for %s on %s: %s", ca, chain, exc)
+
+    if not pairs:
+        try:
+            resp = requests.get(DEXSCREENER_SEARCH.format(ca), timeout=12)
+            resp.raise_for_status()
+            pairs = resp.json().get("pairs") or []
+        except Exception as exc:
+            logger.debug("DexScreener search failed for %s: %s", ca, exc)
+
+    # Solana addresses are case-sensitive on-chain; DexScreener needs correct casing.
+    if not pairs and not ca.startswith("0x") and len(ca) >= 8:
+        for query in (ca[:12], ca[:8]):
+            try:
+                resp = requests.get(DEXSCREENER_SEARCH.format(query), timeout=12)
+                resp.raise_for_status()
+                candidates = resp.json().get("pairs") or []
+                matches = [
+                    p
+                    for p in candidates
+                    if _mints_match((p.get("baseToken") or {}).get("address", ""), ca)
+                    or _mints_match((p.get("quoteToken") or {}).get("address", ""), ca)
+                ]
+                if matches:
+                    pairs = matches
+                    break
+            except Exception as exc:
+                logger.debug("DexScreener prefix search failed for %s: %s", query, exc)
+
+    return pairs
+
+
 def get_dexscreener_data(ca: str) -> Optional[dict]:
     """
     Fetch the highest-liquidity pair for *ca* from DexScreener.
@@ -541,28 +718,7 @@ def get_dexscreener_data(ca: str) -> Optional[dict]:
     if cached and now - cached[0] < CACHE_TTL:
         return cached[1]
 
-    pairs: list[dict] = []
-    for chain in _chains_for_ca(ca):
-        url = DEXSCREENER_TOKEN_PAIRS.format(chain=chain, ca=ca)
-        try:
-            resp = requests.get(url, timeout=12)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list) and data:
-                pairs.extend(data)
-        except Exception as exc:
-            logger.debug("DexScreener token-pairs failed for %s on %s: %s", ca, chain, exc)
-
-    if not pairs:
-        url = DEXSCREENER_SEARCH.format(ca)
-        try:
-            resp = requests.get(url, timeout=12)
-            resp.raise_for_status()
-            pairs = resp.json().get("pairs") or []
-        except Exception as exc:
-            logger.error("DexScreener request failed for %s: %s", ca, exc)
-            return None
-
+    pairs = _fetch_dexscreener_pairs(ca)
     if not pairs:
         return None
 
@@ -571,11 +727,12 @@ def get_dexscreener_data(ca: str) -> Optional[dict]:
     best_liq = -1.0
     for p in pairs:
         liq = float(p.get("liquidity", {}).get("usd") or 0)
-        base_addr = (p.get("baseToken") or {}).get("address", "").lower()
-        quote_addr = (p.get("quoteToken") or {}).get("address", "").lower()
-        if key in (base_addr, quote_addr) and liq > best_liq:
-            best = p
-            best_liq = liq
+        base_addr = (p.get("baseToken") or {}).get("address", "")
+        quote_addr = (p.get("quoteToken") or {}).get("address", "")
+        if _mints_match(base_addr, ca) or _mints_match(quote_addr, ca):
+            if liq > best_liq:
+                best = p
+                best_liq = liq
 
     if best is None:
         # Fallback: highest liquidity pair overall
@@ -583,10 +740,10 @@ def get_dexscreener_data(ca: str) -> Optional[dict]:
 
     base_addr = (best.get("baseToken") or {}).get("address", "")
     quote_addr = (best.get("quoteToken") or {}).get("address", "")
-    if base_addr.lower() == key:
+    if base_addr.lower() == key or _mints_match(base_addr, ca):
         token = best["baseToken"]
         canonical_ca = base_addr
-    elif quote_addr.lower() == key:
+    elif quote_addr.lower() == key or _mints_match(quote_addr, ca):
         token = best.get("quoteToken") or best.get("baseToken") or {}
         canonical_ca = quote_addr
     else:
@@ -643,15 +800,15 @@ def get_dexscreener_data_for_call(call: dict, ca: str) -> Optional[dict]:
     matches = [
         p
         for p in pairs
-        if (p.get("baseToken") or {}).get("address", "").lower() == target
-        or (p.get("quoteToken") or {}).get("address", "").lower() == target
+        if _mints_match((p.get("baseToken") or {}).get("address", ""), ca)
+        or _mints_match((p.get("quoteToken") or {}).get("address", ""), ca)
     ]
     if not matches:
         return None
 
     best = max(matches, key=lambda p: float(p.get("liquidity", {}).get("usd") or 0))
     token = best.get("baseToken") or {}
-    if (token.get("address") or "").lower() != target:
+    if not _mints_match(token.get("address", ""), ca):
         token = best.get("quoteToken") or token
 
     return {
@@ -1319,6 +1476,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    canonical = dex.get("canonical_ca") or ca
     upsert_active_chat(chat.id)
 
     # Build reply
@@ -1333,8 +1491,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Gamble 🎲", callback_data=f"call:gamble:{ca}"),
-                InlineKeyboardButton("Alpha 🏆", callback_data=f"call:alpha:{ca}"),
+                InlineKeyboardButton("Gamble 🎲", callback_data=f"call:gamble:{canonical}"),
+                InlineKeyboardButton("Alpha 🏆", callback_data=f"call:alpha:{canonical}"),
             ]
         ]
     )
@@ -1345,7 +1503,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Store pending call data keyed by the bot's reply message ID
     _pending_calls[sent.message_id] = {
-        "ca": ca,
+        "ca": canonical,
         "thesis": f"{dex['name']} (${dex['symbol']})",
         "initial_mc": dex["fdv"],
         "user_id": update.message.from_user.id,
@@ -1439,7 +1597,6 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Allow DMs from owner (look up call in the main group)
     OWNER_ID = 5063218911
-    MAIN_GROUP = -1003575636670
     is_dm = chat and chat.type == "private"
     if is_dm and (not user or user.id != OWNER_ID):
         await update.message.reply_text("☕ Use /pnl in a group chat!")
@@ -1456,22 +1613,39 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     logger.info("/pnl invoked in chat=%s (lookup=%s) ca=%s", chat.id if chat else 'dm', lookup_chat_id, ca)
-    call = get_any_call(lookup_chat_id, ca)
+    call = lookup_call_for_pnl(lookup_chat_id, ca)
     if not call:
         logger.info("/pnl — no call found for lookup_chat=%s ca=%s", lookup_chat_id, ca)
-        await update.message.reply_text(
-            "☕ No brewed call found for that token in this chat. "
-            "Paste the CA first to submit a call!"
-        )
+        if count_calls() == 0:
+            await update.message.reply_text(
+                "☕ No submitted call found for that token. The bot's call history was reset "
+                "after a recent deploy — paste the CA in the group and tap Gamble/Alpha to "
+                "submit a fresh call, then run /pnl again."
+            )
+        else:
+            await update.message.reply_text(
+                "☕ No submitted call found for that token. "
+                "Paste the CA in the group first to submit a call, then run /pnl again."
+            )
         return
 
+    if call["chat_id"] != lookup_chat_id:
+        logger.info(
+            "/pnl — matched call %s from chat %s (lookup chat %s)",
+            call["id"],
+            call["chat_id"],
+            lookup_chat_id,
+        )
+
     # Fetch current data
-    dex = get_dexscreener_data_for_call(call, ca)
+    lookup_ca = call.get("canonical_ca") or call.get("ca") or ca
+    dex = get_dexscreener_data_for_call(call, lookup_ca)
     if not dex:
-        dex = _dex_from_call(call, ca)
+        dex = _dex_from_call(call, lookup_ca)
     if not dex or (dex.get("fdv", 0) <= 0 and not call.get("pair_address")):
         await update.message.reply_text(
-            "☕ Couldn't fetch current data from DexScreener. Try again shortly!"
+            "☕ Found your call, but couldn't fetch live data from DexScreener right now. "
+            "Try /pnl again in a minute."
         )
         return
 
