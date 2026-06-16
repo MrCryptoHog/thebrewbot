@@ -1211,8 +1211,8 @@ def generate_coffee_card_image(
 # =========================================================================
 def calculate_cafeboard(chat_id: int) -> list[dict]:
     """
-    For each user in the chat, find their highest current x-multiplier
-    (live from DexScreener). Returns sorted list of dicts:
+    For each user in the chat, find their highest ATH post-call x-multiplier.
+    Returns sorted list of dicts:
     [{username, best_x, ca}, ...] descending by best_x.
     """
     calls = get_chat_calls(chat_id)
@@ -1231,9 +1231,10 @@ def calculate_cafeboard(chat_id: int) -> list[dict]:
         best_ticker = ""
         best_call_type = ucalls[0].get("call_type", "alpha")
         for c in ucalls:
-            dex = get_dexscreener_data_for_call(c, c["ca"])
+            lookup_ca = c.get("canonical_ca") or c.get("ca") or ""
+            dex = get_dexscreener_data_for_call(c, lookup_ca)
             if not dex:
-                dex = _dex_from_call(c, c["ca"])
+                dex = _dex_from_call(c, lookup_ca)
             if dex and c["initial_mc"] > 0:
                 peak = resolve_ath_post_call(c, dex)
                 cur_x = peak / c["initial_mc"]
@@ -1267,46 +1268,45 @@ def format_cafeboard(entries: list[dict]) -> str:
 # =========================================================================
 def generate_caption(username: str, x_mult: float, pct_gain: float) -> str:
     """Build a warm coffee-themed caption for the Coffee Card photo."""
-    # Pick a coffee-accurate shot name based on the x multiplier
     if x_mult >= 10:
         compliment = (
-            f"☕ Brewed to perfection! {x_mult:.1f}x "
-            f"— @{username} is the real alpha barista of the café! 🔥"
+            f"☕ Brewed to perfection at {x_mult:.1f}x — "
+            f"@{username} is the real alpha barista of the café 🔥"
         )
     elif x_mult >= 5:
         compliment = (
-            f"☕ Now that's an extra-strong brew! {x_mult:.1f}x gains — "
-            f"the café smells like pure alpha thanks to @{username}! 🔥"
+            f"☕ Extra-strong brew at {x_mult:.1f}x — "
+            f"pure alpha thanks to @{username} 🔥"
         )
-    elif x_mult >= 4:
+    elif x_mult >= 3.5:
         compliment = (
-            f"☕ A solid quad shot! {x_mult:.1f}x — "
-            f"your portfolio is on fire @{username}! 🔥"
+            f"☕ A solid quad shot at {x_mult:.1f}x — "
+            f"your portfolio is on fire @{username} 🔥"
         )
-    elif x_mult >= 3:
+    elif x_mult >= 2.5:
         compliment = (
-            f"☕ A solid triple shot! {x_mult:.1f}x — "
-            f"your portfolio is steaming nicely @{username}! ☕"
+            f"☕ A solid triple shot at {x_mult:.1f}x — "
+            f"your portfolio is steaming nicely @{username}"
         )
-    elif x_mult >= 2:
+    elif x_mult >= 1.75:
         compliment = (
-            f"☕ A solid double shot! {x_mult:.1f}x — "
-            f"your portfolio is warming up @{username}! ☕"
+            f"☕ A solid double shot at {x_mult:.1f}x — "
+            f"your portfolio is warming up @{username}"
         )
     elif x_mult >= 1:
         compliment = (
-            f"☕ The brew is warming up! {x_mult:.1f}x so far — "
-            f"keep that grinder going @{username}! ☕"
+            f"☕ The brew is warming up at {x_mult:.1f}x — "
+            f"keep that grinder going @{username}"
         )
     else:
         compliment = (
-            f"☕ Even the best baristas have off-days. {x_mult:.1f}x for now — "
-            f"the next cup will be stronger @{username}! 💪"
+            f"☕ Even the best baristas have off-days at {x_mult:.1f}x — "
+            f"the next cup will be stronger @{username} 💪"
         )
 
     promo = (
         "Want your personal Coffee Card? "
-        "Join the @TradingBrew community and start sharing your alpha! ☕"
+        "Join the @TradingBrew community and start sharing your alpha."
     )
     return f"{compliment}\n\n{promo}"
 
@@ -1350,8 +1350,8 @@ HELP_TEXT = (
     "<b>2️⃣ Pick Your Brew</b>\n"
     "BrewBot detects the CA, pulls live data from DexScreener, "
     "and gives you two buttons:\n"
-    "  • <b>Alpha 🏆</b> — You're confident in this one\n"
-    "  • <b>Gamble 🎲</b> — It's a degen play\n\n"
+    "  • <b>Alpha</b> 🏆 — You're confident in this one\n"
+    "  • <b>Gamble</b> 🎲 — It's a degen play\n\n"
     "<b>3️⃣ Check Your PnL</b>\n"
     "Run <code>/pnl &lt;contract_address&gt;</code> any time to see "
     "your gains. BrewBot generates a Coffee Card showing your "
@@ -1410,7 +1410,7 @@ async def _send_welcome(chat_id: int, chat_title: str, context: ContextTypes.DEF
         "Come back later to check your PnL with a Coffee Card.\n\n"
         "<b>How to use me:</b>\n\n"
         "<b>1.</b> Paste a contract address\n"
-        "<b>2.</b> Tap <b>Alpha 🏆</b> or <b>Gamble 🎲</b> to lock in your call\n"
+        "<b>2.</b> Tap <b>Alpha</b> 🏆 or <b>Gamble</b> 🎲 to lock in your call\n"
         "<b>3.</b> Run <code>/pnl &lt;CA&gt;</code> to see your gains on a Coffee Card\n"
         "<b>4.</b> Run <code>/cafeboard</code> to see who's the top caller\n\n"
         "Attached below is an example Coffee Card — "
@@ -1518,7 +1518,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"💰 Market Cap (FDV): <b>{fmt_usd(dex['fdv'])}</b>\n"
         f"💧 Liquidity: <b>{fmt_usd(dex['liquidity_usd'])}</b>\n"
         f"📊 24h Volume: <b>{fmt_usd(dex['volume_24h'])}</b>\n\n"
-        f"<i>Pick your brew below ↓</i>"
+        f"<i>Tap <b>Alpha</b> 🏆 or <b>Gamble</b> 🎲 below to submit your call</i>"
     )
 
     keyboard = InlineKeyboardMarkup(
@@ -1602,13 +1602,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Clean up pending
     del _pending_calls[msg_id]
 
-    type_label = "Gamble 🎲" if call_type == "gamble" else "Alpha 🏆"
+    if call_type == "gamble":
+        type_label = "<b>Gamble</b> 🎲"
+    else:
+        type_label = "<b>Alpha</b> 🏆"
     confirm_text = (
         f"☕ <b>{dex['name']}</b> (${dex['symbol']})\n\n"
         f"💰 Market Cap (FDV): <b>{fmt_usd(dex['fdv'])}</b>\n"
         f"💧 Liquidity: <b>{fmt_usd(dex['liquidity_usd'])}</b>\n"
         f"📊 24h Volume: <b>{fmt_usd(dex['volume_24h'])}</b>\n\n"
-        f"✅ Call submitted as <b>{type_label}</b>! ☕ Initial MC locked in."
+        f"✅ Call submitted as {type_label} ☕ Initial MC locked in."
     )
 
     await query.edit_message_text(text=confirm_text, parse_mode="HTML")
