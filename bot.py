@@ -49,6 +49,16 @@ def _init_data_dir() -> str:
     """Pick a writable directory for SQLite (prefer Railway volume at /data)."""
     preferred = os.getenv("DATA_DIR", "/data")
     local = os.path.dirname(os.path.abspath(__file__))
+
+    # Volume mount creates /data — always use it when present (never split DB across paths).
+    if os.path.isdir(preferred):
+        try:
+            os.makedirs(preferred, exist_ok=True)
+            logger.info("Using persistent data directory: %s", preferred)
+            return preferred
+        except OSError as exc:
+            logger.error("Persistent volume %s not writable: %s", preferred, exc)
+
     for candidate in (preferred, local):
         try:
             os.makedirs(candidate, exist_ok=True)
@@ -56,9 +66,7 @@ def _init_data_dir() -> str:
             with open(probe, "w", encoding="utf-8") as fh:
                 fh.write("ok")
             os.remove(probe)
-            if candidate == preferred:
-                logger.info("Using persistent data directory: %s", candidate)
-            else:
+            if candidate != preferred:
                 logger.warning(
                     "Persistent volume %s unavailable — using %s (DB resets on redeploy)",
                     preferred,
@@ -108,9 +116,10 @@ _pending_calls: dict[int, dict] = {}
 # =========================================================================
 def _get_db() -> sqlite3.Connection:
     """Return a connection with WAL mode enabled."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 
@@ -309,8 +318,17 @@ def get_user_call(chat_id: int, user_id: int, ca: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def _normalize_ca(ca: str) -> str:
+    """Strip whitespace and invisible chars from a pasted contract address."""
+    cleaned = ca.strip()
+    for ch in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        cleaned = cleaned.replace(ch, "")
+    return cleaned
+
+
 def get_any_call(chat_id: int, ca: str) -> Optional[dict]:
     """Fetch the first call for this CA in a chat, regardless of who made it."""
+    ca = _normalize_ca(ca)
     key = ca.lower()
     with _get_db() as conn:
         row = conn.execute(
@@ -323,6 +341,7 @@ def get_any_call(chat_id: int, ca: str) -> Optional[dict]:
 
 def get_call_by_ca_any_chat(ca: str) -> Optional[dict]:
     """Find a call for this CA in any chat (fallback when group DB was reset)."""
+    ca = _normalize_ca(ca)
     key = ca.lower()
     with _get_db() as conn:
         row = conn.execute(
@@ -380,16 +399,29 @@ def _resolve_dex_mint(ca: str) -> Optional[str]:
 
 
 def lookup_call_for_pnl(chat_id: int, ca: str) -> Optional[dict]:
-    """Resolve a stored call for /pnl — exact match, DexScreener mint, then fuzzy."""
-    candidates: list[str] = [ca]
-    resolved = _resolve_dex_mint(ca)
-    if resolved and resolved not in candidates:
-        candidates.append(resolved)
+    """Resolve a stored call for /pnl — direct SQL first, then Dex + fuzzy fallbacks."""
+    ca = _normalize_ca(ca)
+    key = ca.lower()
 
-    for candidate in candidates:
-        hit = get_any_call(chat_id, candidate) or get_call_by_ca_any_chat(candidate)
-        if hit:
-            return hit
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM calls WHERE LOWER(ca)=? OR LOWER(canonical_ca)=? "
+            "ORDER BY CASE WHEN chat_id=? THEN 0 ELSE 1 END, id ASC LIMIT 1",
+            (key, key, chat_id),
+        ).fetchone()
+    if row:
+        return dict(row)
+
+    resolved = _resolve_dex_mint(ca)
+    if resolved and resolved.lower() != key:
+        with _get_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM calls WHERE LOWER(ca)=? OR LOWER(canonical_ca)=? "
+                "ORDER BY CASE WHEN chat_id=? THEN 0 ELSE 1 END, id ASC LIMIT 1",
+                (resolved.lower(), resolved.lower(), chat_id),
+            ).fetchone()
+        if row:
+            return dict(row)
 
     return _fuzzy_find_call(chat_id, ca) or _fuzzy_find_call(chat_id, ca, any_chat=True)
 
@@ -1286,12 +1318,13 @@ def detect_ca(text: str) -> Optional[str]:
     """Return the first Ethereum or Solana contract address found in text."""
     m = ETH_CA_RE.search(text)
     if m:
-        return m.group(0)
+        return _normalize_ca(m.group(0))
     # For Solana, be stricter: must be 32-44 base58 chars, surrounded by whitespace/boundaries
     # We iterate tokens to avoid false positives on normal words
     for token in text.split():
-        if SOL_CA_RE.fullmatch(token) and len(token) >= 32:
-            return token
+        cleaned = _normalize_ca(token)
+        if SOL_CA_RE.fullmatch(cleaned) and len(cleaned) >= 32:
+            return cleaned
     return None
 
 
@@ -1615,7 +1648,14 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     logger.info("/pnl invoked in chat=%s (lookup=%s) ca=%s", chat.id if chat else 'dm', lookup_chat_id, ca)
     call = lookup_call_for_pnl(lookup_chat_id, ca)
     if not call:
-        logger.info("/pnl — no call found for lookup_chat=%s ca=%s", lookup_chat_id, ca)
+        total = count_calls()
+        logger.warning(
+            "/pnl miss db=%s lookup_chat=%s ca=%r total_calls=%d",
+            DB_PATH,
+            lookup_chat_id,
+            ca,
+            total,
+        )
         if count_calls() == 0:
             await update.message.reply_text(
                 "☕ No submitted call found for that token. The bot's call history was reset "
@@ -1795,6 +1835,7 @@ def main() -> None:
 
     init_db()
     seed_restored_calls()
+    logger.info("Database ready: %s (%d calls)", DB_PATH, count_calls())
     _check_playwright()
 
     app = Application.builder().token(BOT_TOKEN).build()

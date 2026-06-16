@@ -6,3 +6,7 @@ buildCommand = "pip install playwright && playwright install --with-deps chromiu
 startCommand = "python bot.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
+numReplicas = 1
+
+[env]
+DATA_DIR = "/data"
