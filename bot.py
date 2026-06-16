@@ -306,7 +306,8 @@ def _parse_call_timestamp(call: dict) -> int:
         return 0
 
 
-def _price_high_to_mcap(high_price: float, reference_mcap: float, reference_price: float) -> float:`r`n    """Convert an OHLC high to market cap using a live mcap/price reference."""
+def _price_high_to_mcap(high_price: float, reference_mcap: float, reference_price: float) -> float:
+    """Convert an OHLC high to market cap using a live mcap/price reference."""
     if high_price <= 0 or reference_price <= 0 or reference_mcap <= 0:
         return 0.0
     return reference_mcap * (high_price / reference_price)
